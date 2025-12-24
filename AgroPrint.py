@@ -3,6 +3,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
+import sqlite3
+import json
 import uuid
 from datetime import datetime
 
@@ -19,7 +21,8 @@ def inicializar_session_state():
         st.session_state.current_project_id = None
         st.session_state.current_project_name = None
         st.session_state.supabase = None
-        
+        st.session_state.modo_visualizacion = False  # True = solo ver, False = editar
+
         # Variables de cálculo
         st.session_state.emisiones_etapas = {}
         st.session_state.produccion_etapas = {}
@@ -63,12 +66,647 @@ def inicializar_session_state():
         st.session_state.tipo_suelo = ""
         st.session_state.clima = ""
         st.session_state.morfologia = ""
+
+        # === NUEVA ESTRUCTURA DE DATOS - REEMPLAZA LA ANTERIOR ===
+        # Datos mientras se ingresan (volátiles)
+        st.session_state.datos_en_edicion = {}
+        
+        # Datos confirmados (para cálculos)
+        st.session_state.datos_confirmados = {
+            "caracterizacion": {},
+            "fertilizantes": {},
+            "agroquimicos": {},
+            "riego": {},
+            "maquinaria": {},
+            "residuos": {},
+            "etapas": {}
+        }
+        
+        # Control de guardado
+        st.session_state.guardado_pendiente = False  # REEMPLAZA datos_pendientes_guardar
+        st.session_state.ultimo_guardado = None
+        st.session_state.ultimo_cambio = None
+        
+        # Estado del proyecto
+        st.session_state.proyecto_es_local = True  # True hasta que se guarde en Supabase
+        st.session_state.proyecto_version = 1
         
         # Marcar como inicializado
         st.session_state.inicializado = True
 
 # Ejecutar la inicialización al inicio
 inicializar_session_state()
+
+# =============================================================================
+# SISTEMA DE GUARDADO CONTROLADO
+# =============================================================================
+
+def guardar_proyecto_completo():
+    """Guarda todo el proyecto actual en Supabase - VERSIÓN DEFINITIVA"""
+    
+    if st.session_state.supabase is None:
+        st.error("❌ No hay conexión con Supabase")
+        return False
+    
+    try:
+        # =========================================================================
+        # 1. RECOLECTAR DATOS
+        # =========================================================================
+        datos_completos = recolectar_todos_los_datos_para_guardar()
+        
+        # Verificar que hay datos
+        if not datos_completos.get("characterization") or not datos_completos.get("results"):
+            st.error("❌ No hay datos suficientes para guardar")
+            return False
+        
+        # =========================================================================
+        # 2. PREPARAR DATOS PARA SUPABASE
+        # =========================================================================
+        project_data = {
+            "user_email": st.session_state.current_user_email,
+            "title": st.session_state.current_project_name,
+            "mode": "anual" if st.session_state.get('modo_anterior', 'Anual') == 'Anual' else "perenne",
+            "characterization": datos_completos["characterization"],
+            "sources_data": datos_completos["sources_data"],
+            "results": datos_completos["results"],
+            "app_version": "2.0",
+            "updated_at": datetime.now().isoformat(),
+            "created_at": datetime.now().isoformat()  # Siempre agregar fecha creación
+        }
+        
+        # =========================================================================
+        # 3. GUARDAR EN SUPABASE (SIEMPRE COMO NUEVO)
+        # =========================================================================
+        # REGLA SIMPLE: Si el proyecto es local o empieza con 'local_', crear NUEVO
+        # Si ya tiene ID de Supabase, intentar actualizar
+        
+        project_id = st.session_state.get('current_project_id')
+        
+        # ¿Es un proyecto local?
+        es_proyecto_local = False
+        if isinstance(project_id, str):
+            if project_id.startswith('local_') or project_id.startswith('nuevo_'):
+                es_proyecto_local = True
+            elif len(project_id) == 36:  # Es un UUID
+                # Verificar si existe en Supabase
+                try:
+                    response = st.session_state.supabase.table("projects")\
+                        .select("id")\
+                        .eq("id", project_id)\
+                        .execute()
+                    
+                    if not response.data or len(response.data) == 0:
+                        # UUID no existe en Supabase = tratar como local
+                        es_proyecto_local = True
+                except:
+                    # Si hay error, asumir que no existe
+                    es_proyecto_local = True
+        
+        if es_proyecto_local or not project_id:
+            # CREAR NUEVO PROYECTO
+            st.info("🆕 Creando nuevo proyecto en la nube...")
+            
+            try:
+                response = st.session_state.supabase.table("projects")\
+                    .insert(project_data)\
+                    .execute()
+                
+                if response.data and len(response.data) > 0:
+                    nuevo_id_real = response.data[0]['id']
+                    
+                    # ACTUALIZAR ESTADO
+                    st.session_state.current_project_id = nuevo_id_real
+                    st.session_state.proyecto_es_local = False
+                    st.session_state.modo_visualizacion = True  # CAMBIAR A MODO VISUALIZACIÓN
+                    st.session_state.guardado_pendiente = False
+                    st.session_state.ultimo_guardado = datetime.now().strftime("%H:%M:%S")
+                    
+                    st.success(f"✅ Proyecto '{st.session_state.current_project_name}' guardado en la nube")
+                    return True
+                else:
+                    st.error("❌ Error: Supabase no devolvió ID del proyecto")
+                    return False
+                    
+            except Exception as e:
+                st.error(f"❌ Error al crear proyecto: {str(e)}")
+                return False
+                
+        else:
+            # ACTUALIZAR PROYECTO EXISTENTE (solo si ya existe en Supabase)
+            st.info("🔄 Actualizando proyecto existente...")
+            
+            try:
+                response = st.session_state.supabase.table("projects")\
+                    .update(project_data)\
+                    .eq("id", str(project_id))\
+                    .execute()
+                
+                if hasattr(response, 'data') and response.data:
+                    st.session_state.modo_visualizacion = True  # CAMBIAR A MODO VISUALIZACIÓN
+                    st.session_state.guardado_pendiente = False
+                    st.session_state.ultimo_guardado = datetime.now().strftime("%H:%M:%S")
+                    st.success("✅ Proyecto actualizado en la nube")
+                    return True
+                else:
+                    st.warning("⚠️ Proyecto no encontrado en la nube. Creando como nuevo...")
+                    
+                    # Crear como nuevo
+                    response = st.session_state.supabase.table("projects")\
+                        .insert(project_data)\
+                        .execute()
+                    
+                    if response.data and len(response.data) > 0:
+                        nuevo_id_real = response.data[0]['id']
+                        st.session_state.current_project_id = nuevo_id_real
+                        st.session_state.proyecto_es_local = False
+                        st.session_state.modo_visualizacion = True
+                        st.session_state.guardado_pendiente = False
+                        st.session_state.ultimo_guardado = datetime.now().strftime("%H:%M:%S")
+                        st.success(f"✅ Proyecto recreado con nuevo ID: {nuevo_id_real}")
+                        return True
+                    else:
+                        st.error("❌ No se pudo recrear el proyecto")
+                        return False
+                        
+            except Exception as e:
+                st.error(f"❌ Error al actualizar: {str(e)}")
+                return False
+        
+        return False
+        
+    except Exception as e:
+        st.error(f"❌ Error general al guardar: {str(e)}")
+        return False
+
+def es_uuid_valido(uuid_string):
+    """Verifica si un string es un UUID válido"""
+    import uuid as uuid_lib
+    try:
+        uuid_obj = uuid_lib.UUID(str(uuid_string))
+        return True
+    except ValueError:
+        return False
+
+def migrar_datos_a_nuevo_id(id_antiguo, id_nuevo):
+    """
+    Migra todos los datos vinculados al ID antiguo al ID nuevo.
+    Esto evita que se pierdan datos cuando un proyecto local se guarda en la nube.
+    """
+    try:
+        # Buscar todas las claves que contienen el ID antiguo
+        claves_a_migrar = []
+        for clave in st.session_state.keys():
+            if isinstance(clave, str) and id_antiguo in clave:
+                claves_a_migrar.append(clave)
+        
+        # Migrar cada clave
+        for clave_antigua in claves_a_migrar:
+            clave_nueva = clave_antigua.replace(id_antiguo, id_nuevo)
+            st.session_state[clave_nueva] = st.session_state[clave_antigua]
+            
+            # Opcional: eliminar la clave antigua para limpiar
+            # del st.session_state[clave_antigua]
+        
+        return len(claves_a_migrar)
+    except Exception as e:
+        st.error(f"Error migrando datos: {e}")
+        return 0
+
+def recolectar_todos_los_datos_para_guardar():
+    """
+    Recolecta todos los datos para guardar en Supabase.
+    VERSIÓN CORREGIDA DEFINITIVA - Estructura correcta.
+    """
+    try:
+        # =====================================================================
+        # DEBUG: Verificar qué hay realmente en datos_confirmados
+        # =====================================================================
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**🔍 VERIFICACIÓN PRE-GUARDADO**")
+        
+        # Obtener datos confirmados actuales
+        datos_confirmados = st.session_state.get('datos_confirmados', {})
+        
+        # Mostrar estructura real
+        st.sidebar.write("Estructura REAL de datos_confirmados:")
+        
+        for tipo in ['fertilizantes', 'agroquimicos', 'riego', 'maquinaria', 'residuos']:
+            if tipo in datos_confirmados:
+                etapas = datos_confirmados[tipo]
+                if isinstance(etapas, dict):
+                    for etapa, datos in etapas.items():
+                        if isinstance(datos, list):
+                            st.sidebar.write(f"• {tipo}.{etapa}: {len(datos)} items")
+                        elif datos:
+                            st.sidebar.write(f"• {tipo}.{etapa}: (dict/list)")
+                elif etapas:
+                    st.sidebar.write(f"• {tipo}: {type(etapas)}")
+        
+        # =====================================================================
+        # 1. OBTENER DATOS DE CARACTERIZACIÓN
+        # =====================================================================
+        caracterizacion = {
+            "cultivo": st.session_state.get('cultivo', ''),
+            "ubicacion": st.session_state.get('ubicacion', ''),
+            "tipo_suelo": st.session_state.get('tipo_suelo', ''),
+            "clima": st.session_state.get('clima', ''),
+            "morfologia": st.session_state.get('morfologia', ''),
+            "extra": st.session_state.get('extra', '')
+        }
+        
+        # =====================================================================
+        # 2. OBTENER DATOS DE FORMULARIOS - ESTRUCTURA CORRECTA
+        # =====================================================================
+        # Asegurar que tengamos datos_confirmados
+        if 'datos_confirmados' not in st.session_state:
+            st.session_state.datos_confirmados = {}
+        
+        datos_confirmados = st.session_state.datos_confirmados
+        
+        # Crear sources_data con la estructura CORRECTA que Supabase espera
+        sources_data = {}
+        
+        # Lista de tipos de datos
+        tipos = ['fertilizantes', 'agroquimicos', 'riego', 'maquinaria', 'residuos']
+        
+        for tipo in tipos:
+            # Obtener los datos para este tipo
+            if tipo in datos_confirmados:
+                datos_tipo = datos_confirmados[tipo]
+                
+                # Verificar la estructura real
+                if isinstance(datos_tipo, dict):
+                    # Estructura: {'ciclo_tipico': [lista de datos]}
+                    # Necesitamos guardar esto tal cual
+                    sources_data[tipo] = datos_tipo
+                elif isinstance(datos_tipo, list):
+                    # Si es una lista directa, convertir a estructura con etapa
+                    sources_data[tipo] = {'ciclo_tipico': datos_tipo}
+                else:
+                    # Estructura vacía
+                    sources_data[tipo] = {}
+            else:
+                # No hay datos de este tipo
+                sources_data[tipo] = {}
+        
+        # =====================================================================
+        # 3. OBTENER RESULTADOS CALCULADOS
+        # =====================================================================
+        em_total = st.session_state.get('em_total', 0)
+        prod_total = st.session_state.get('prod_total', 0)
+        
+        results = {
+            "emisiones_totales": float(em_total),
+            "produccion_total": float(prod_total),
+            "huella_por_kg": float(em_total / prod_total if prod_total > 0 else 0),
+            "emisiones_etapas": st.session_state.get('emisiones_etapas', {}),
+            "produccion_etapas": st.session_state.get('produccion_etapas', {}),
+            "emisiones_fuentes": st.session_state.get('emisiones_fuentes', {}),
+            "emisiones_ciclos": st.session_state.get('emisiones_ciclos', []),
+            "desglose_fuentes_ciclos": st.session_state.get('desglose_fuentes_ciclos', []),
+            "fecha_calculo": datetime.now().isoformat()
+        }
+        
+        # =====================================================================
+        # 4. OBTENER CONFIGURACIÓN DE CICLOS
+        # =====================================================================
+        config_ciclos = {
+            "n_ciclos": st.session_state.get('n_ciclos', 1),
+            "ciclos_diferentes": st.session_state.get('ciclos_diferentes', 'No, todos los ciclos son iguales')
+        }
+        
+        # =====================================================================
+        # 5. DETERMINAR MODO CORRECTO
+        # =====================================================================
+        modo_actual = st.session_state.get('modo_anterior', 'Anual')
+        mode = "anual" if str(modo_actual).strip().lower() == "anual" else "perenne"
+        
+        # =====================================================================
+        # 6. VERIFICACIÓN FINAL - Mostrar qué se va a guardar
+        # =====================================================================
+        st.sidebar.markdown("**📊 Lo que se ENVIARÁ a Supabase:**")
+        
+        for tipo in tipos:
+            if tipo in sources_data:
+                datos = sources_data[tipo]
+                if isinstance(datos, dict):
+                    for etapa, lista_datos in datos.items():
+                        if isinstance(lista_datos, list):
+                            st.sidebar.write(f"✓ {tipo}.{etapa}: {len(lista_datos)} registros")
+                        elif lista_datos:
+                            st.sidebar.write(f"✓ {tipo}.{etapa}: datos presentes")
+        
+        # =====================================================================
+        # 7. ESTRUCTURA COMPLETA PARA SUPABASE
+        # =====================================================================
+        datos_completos = {
+            "characterization": caracterizacion,
+            "sources_data": sources_data,
+            "results": results,
+            "config_ciclos": config_ciclos,
+            "mode": mode,
+            "app_version": "2.0",
+            "updated_at": datetime.now().isoformat()
+        }
+                
+        return datos_completos
+        
+    except Exception as e:
+        st.error(f"❌ Error recolectando datos: {str(e)}")
+        st.sidebar.error(f"Error en recolectar_datos: {e}")
+        
+        # Retornar estructura mínima para evitar errores
+        return {
+            "characterization": {},
+            "sources_data": {},
+            "results": {},
+            "config_ciclos": {},
+            "mode": "anual",
+            "app_version": "2.0",
+            "updated_at": datetime.now().isoformat()
+        }
+
+def verificar_datos_en_supabase():
+    """Función temporal para verificar qué hay en Supabase"""
+    
+    if st.sidebar.button("🔍 Verificar datos en Supabase"):
+        if st.session_state.supabase and st.session_state.current_project_id:
+            try:
+                # Cargar el proyecto desde Supabase
+                response = st.session_state.supabase.table("projects")\
+                    .select("*")\
+                    .eq("id", st.session_state.current_project_id)\
+                    .execute()
+                
+                if response.data:
+                    proyecto = response.data[0]
+                    
+                    st.sidebar.markdown("**📦 Datos en Supabase:**")
+                    
+                    # Mostrar sources_data
+                    sources_data = proyecto.get('sources_data', {})
+                    st.sidebar.write("sources_data:")
+                    for tipo, datos in sources_data.items():
+                        if isinstance(datos, dict):
+                            for etapa, lista in datos.items():
+                                if isinstance(lista, list):
+                                    st.sidebar.write(f"  {tipo}.{etapa}: {len(lista)} items")
+                                else:
+                                    st.sidebar.write(f"  {tipo}.{etapa}: {type(lista)}")
+                        else:
+                            st.sidebar.write(f"  {tipo}: {type(datos)}")
+                    
+                    # Mostrar mode
+                    st.sidebar.write(f"mode: {proyecto.get('mode', 'No especificado')}")
+                    
+                else:
+                    st.sidebar.warning("No se encontró el proyecto en Supabase")
+                    
+            except Exception as e:
+                st.sidebar.error(f"Error: {e}")
+        else:
+            st.sidebar.warning("No hay conexión con Supabase")
+
+def actualizar_datos_desde_widgets():
+    """
+    Asegura que los datos en datos_confirmados sean los actuales de los widgets.
+    Esta función debe llamarse ANTES de guardar en Supabase.
+    """
+    # Esta función no hace nada activamente porque los widgets de Streamlit
+    # ya actualizan session_state automáticamente cuando se renderizan.
+    # En su lugar, verificamos que los datos estén en datos_confirmados.
+    
+    # Solo para debug: mostrar qué hay en datos_confirmados
+    if 'datos_confirmados' in st.session_state:
+        # Contar cuántos datos hay
+        fertilizantes = st.session_state.datos_confirmados.get('fertilizantes', {})
+        agroquimicos = st.session_state.datos_confirmados.get('agroquimicos', {})
+        
+        # Mostrar conteo en el sidebar para debug
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**🔍 Datos en memoria:**")
+        st.sidebar.write(f"Fertilizantes: {sum(len(v) for v in fertilizantes.values() if isinstance(v, list))} registros")
+        st.sidebar.write(f"Agroquímicos: {sum(len(v) for v in agroquimicos.values() if isinstance(v, list))} registros")
+        
+        # Verificar que haya datos en ciclo_tipico (modo anual)
+        if 'ciclo_tipico' in fertilizantes:
+            st.sidebar.write(f"Fertilizantes en ciclo_tipico: {len(fertilizantes['ciclo_tipico'])}")
+
+def verificar_datos_para_guardar():
+    """Función temporal para verificar qué datos se van a guardar"""
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🔍 Verificar datos a guardar")
+    
+    if st.sidebar.button("📊 Ver datos recopilados"):
+        datos = recolectar_todos_los_datos_para_guardar()
+        
+        st.sidebar.markdown("**Datos de caracterización:**")
+        st.sidebar.json(datos.get("characterization", {}))
+        
+        st.sidebar.markdown("**Fuentes de datos:**")
+        for tipo, etapas in datos.get("sources_data", {}).items():
+            st.sidebar.write(f"{tipo}: {len(etapas)} etapa(s)")
+        
+        st.sidebar.markdown("**Resultados:**")
+        st.sidebar.json({
+            "emisiones_totales": datos.get("results", {}).get("emisiones_totales", 0),
+            "produccion_total": datos.get("results", {}).get("produccion_total", 0)
+        })
+
+def cargar_datos_desde_proyecto(project_data):
+    """
+    Carga COMPLETAMENTE los datos de un proyecto desde Supabase.
+    VERSIÓN COMPLETA Y ROBUSTA.
+    """
+    try:
+        if not project_data:
+            st.error("❌ No hay datos del proyecto para cargar")
+            return False
+        
+        # =====================================================================
+        # 1. LIMPIAR DATOS ANTERIORES
+        # =====================================================================
+        # Limpiar solo claves específicas, mantener otras importantes
+        claves_a_limpiar = []
+        for clave in list(st.session_state.keys()):
+            if any(clave.startswith(prefijo) for prefijo in 
+                   ['fertilizantes_data_', 'agroquimicos_data_', 'riego_data_', 
+                    'maquinaria_data_', 'residuos_data_', 'etapas_data_']):
+                claves_a_limpiar.append(clave)
+        
+        for clave in claves_a_limpiar:
+            try:
+                del st.session_state[clave]
+            except:
+                pass
+        
+        # =====================================================================
+        # 2. CARGAR CARACTERIZACIÓN
+        # =====================================================================
+        if 'characterization' in project_data and project_data['characterization']:
+            car = project_data['characterization']
+            st.session_state.cultivo = car.get('cultivo', '')
+            st.session_state.ubicacion = car.get('ubicacion', '')
+            st.session_state.tipo_suelo = car.get('tipo_suelo', '')
+            st.session_state.clima = car.get('clima', '')
+            st.session_state.morfologia = car.get('morfologia', '')
+            st.session_state.extra = car.get('extra', '')
+        
+        # =====================================================================
+        # 3. CARGAR DATOS DE FORMULARIOS
+        # =====================================================================
+        # Inicializar estructura
+        st.session_state.datos_confirmados = {
+            "caracterizacion": {},
+            "fertilizantes": {},
+            "agroquimicos": {},
+            "riego": {},
+            "maquinaria": {},
+            "residuos": {},
+            "etapas": {}
+        }
+        
+        if 'sources_data' in project_data and project_data['sources_data']:
+            sources = project_data['sources_data']
+            
+            # Cargar cada tipo de datos
+            tipos = ['fertilizantes', 'agroquimicos', 'riego', 'maquinaria', 'residuos']
+            for tipo in tipos:
+                if tipo in sources and sources[tipo]:
+                    st.session_state.datos_confirmados[tipo] = sources[tipo]
+        
+        # =====================================================================
+        # 4. CARGAR CONFIGURACIÓN DE CICLOS
+        # =====================================================================
+        if 'config_ciclos' in project_data and project_data['config_ciclos']:
+            config = project_data['config_ciclos']
+            st.session_state.n_ciclos = config.get('n_ciclos', 1)
+            st.session_state.ciclos_diferentes = config.get('ciclos_diferentes', 'No, todos los ciclos son iguales')
+        else:
+            # Valores por defecto
+            st.session_state.n_ciclos = 1
+            st.session_state.ciclos_diferentes = 'No, todos los ciclos son iguales'
+        
+        # =====================================================================
+        # 5. CARGAR RESULTADOS CALCULADOS
+        # =====================================================================
+        if 'results' in project_data and project_data['results']:
+            res = project_data['results']
+            
+            # Variables principales
+            st.session_state.em_total = float(res.get('emisiones_totales', 0))
+            st.session_state.prod_total = float(res.get('produccion_total', 0))
+            
+            # Estructuras de datos
+            st.session_state.emisiones_etapas = res.get('emisiones_etapas', {})
+            st.session_state.produccion_etapas = res.get('produccion_etapas', {})
+            st.session_state.emisiones_fuentes = res.get('emisiones_fuentes', {})
+            st.session_state.emisiones_fuente_etapa = res.get('emisiones_fuente_etapa', {})
+            
+            # Datos específicos de modo anual
+            st.session_state.emisiones_ciclos = res.get('emisiones_ciclos', [])
+            st.session_state.desglose_fuentes_ciclos = res.get('desglose_fuentes_ciclos', [])
+            
+            # Guardar resultados globales para acceso fácil
+            st.session_state.resultados_globales = {
+                "tipo": "anual",
+                "em_total": st.session_state.em_total,
+                "prod_total": st.session_state.prod_total,
+                "emisiones_ciclos": st.session_state.emisiones_ciclos,
+                "desglose_fuentes_ciclos": st.session_state.desglose_fuentes_ciclos
+            }
+        
+        # =====================================================================
+        # 6. CARGAR MODO
+        # =====================================================================
+        if 'mode' in project_data:
+            mode_db = project_data['mode']
+            st.session_state.modo_anterior = "Anual" if str(mode_db).lower() == "anual" else "Perenne"
+        else:
+            st.session_state.modo_anterior = "Anual"
+        
+        # =====================================================================
+        # 7. ESTABLECER ESTADO DEL PROYECTO
+        # =====================================================================
+        st.session_state.modo_visualizacion = True  # Proyecto cargado = solo lectura
+        st.session_state.proyecto_es_local = False  # Ya está en la nube
+        st.session_state.guardado_pendiente = False  # No hay cambios sin guardar
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Error cargando datos del proyecto: {str(e)}")
+        return False
+
+def obtener_datos_de_session_state(tipo, etapa):
+    """Obtiene datos de session_state"""
+    clave = f"{tipo}_data_{etapa}"
+    return st.session_state.get(clave, [])
+
+def recolectar_todos_los_datos():
+    """Recolecta todos los datos de entrada del usuario en un solo objeto"""
+    
+    datos = {
+        "caracterizacion": {
+            "cultivo": st.session_state.get('cultivo', ''),
+            "ubicacion": st.session_state.get('ubicacion', ''),
+            "tipo_suelo": st.session_state.get('tipo_suelo', ''),
+            "clima": st.session_state.get('clima', ''),
+            "morfologia": st.session_state.get('morfologia', ''),
+            "extra": st.session_state.get('extra', '')
+        },
+        "fertilizantes": {},
+        "agroquimicos": {},
+        "riego": {},
+        "maquinaria": {},
+        "residuos": {},
+        "etapas": st.session_state.get('etapas_data', {})
+    }
+    
+    # Recolectar datos por etapa
+    for key in st.session_state.keys():
+        if key.startswith("fertilizantes_"):
+            etapa = key.replace("fertilizantes_", "")
+            datos["fertilizantes"][etapa] = st.session_state[key]
+        elif key.startswith("agroquimicos_"):
+            etapa = key.replace("agroquimicos_", "")
+            datos["agroquimicos"][etapa] = st.session_state[key]
+        # ... (similar para otros tipos de datos)
+    
+    return datos
+
+def mostrar_estado_datos():
+    """Función temporal para verificar qué datos hay en session_state"""
+    if st.sidebar.button("🔍 Ver datos en memoria"):
+        st.sidebar.markdown("### Datos en session_state:")
+        
+        datos_claves = []
+        for clave in st.session_state.keys():
+            if "data_" in clave or clave in ['cultivo', 'ubicacion', 'em_total', 'prod_total']:
+                valor = st.session_state[clave]
+                if isinstance(valor, (list, dict)) and valor:
+                    datos_claves.append(f"{clave}: {len(valor) if isinstance(valor, list) else 'dict'}")
+                elif valor:
+                    datos_claves.append(f"{clave}: {valor}")
+        
+        if datos_claves:
+            for dato in datos_claves:
+                st.sidebar.text(dato)
+        else:
+            st.sidebar.warning("No hay datos en memoria")
+        
+        # Mostrar datos a guardar
+        st.sidebar.markdown("### Datos a guardar:")
+        datos_a_guardar = {
+            "caracterizacion": {
+                "cultivo": st.session_state.get('cultivo'),
+                "ubicacion": st.session_state.get('ubicacion')
+            },
+            "fertilizantes": sum(1 for k in st.session_state.keys() if "fertilizantes_data_" in k),
+            "agroquimicos": sum(1 for k in st.session_state.keys() if "agroquimicos_data_" in k),
+            "em_total": st.session_state.get('em_total', 0)
+        }
+        st.sidebar.json(datos_a_guardar)
 
 # =============================================================================
 # SISTEMA DE CONSENTIMIENTO Y TÉRMINOS
@@ -286,62 +924,52 @@ def upload_excel_to_storage(supabase, file_path, project_id):
         return None
 
 def guardar_proyecto_manual():
-    """Guarda manualmente el proyecto actual en Supabase - VERSIÓN SIMPLIFICADA"""
-    try:
-        # Verificar que tenemos conexión
-        if st.session_state.supabase is None:
-            st.error("❌ No hay conexión con Supabase")
-            return False
+    """Guarda manualmente el proyecto actual en Supabase - VERSIÓN CONTROLADA"""
+    
+    # Crear un formulario dedicado solo para guardar
+    with st.form(key="guardar_proyecto_form", border=False):
+        st.markdown("### 💾 Guardar Proyecto")
         
-        # Verificar que no es proyecto local
-        project_id = st.session_state.get('current_project_id')
-        if isinstance(project_id, str) and project_id.startswith('local_'):
-            st.error("❌ Los proyectos locales no se pueden guardar en la nube")
-            st.info("💡 Usa el botón 'Crear copia en la nube' para guardar este proyecto")
-            return False
+        # Nombre del proyecto (editable)
+        nuevo_nombre = st.text_input(
+            "Nombre del proyecto",
+            value=st.session_state.current_project_name,
+            help="Puedes cambiar el nombre del proyecto si lo deseas"
+        )
         
-        # Obtener datos básicos del proyecto
-        em_total = st.session_state.get('em_total', 0)
-        prod_total = st.session_state.get('prod_total', 1)
+        st.warning("""
+        **⚠️ ADVERTENCIA: Esto guardará TODOS los datos ingresados hasta ahora.**
+        - Los datos se guardarán en la nube
+        - Podrás recuperarlos en cualquier momento
+        - Se sobrescribirá la versión anterior si ya existe
+        """)
         
-        # Preparar datos para Supabase
-        project_data = {
-            "user_email": st.session_state.current_user_email,
-            "title": st.session_state.current_project_name,
-            "characterization": {
-                "cultivo": st.session_state.get('cultivo', 'No especificado'),
-                "ubicacion": st.session_state.get('ubicacion', 'No especificado'),
-                "tipo_suelo": st.session_state.get('tipo_suelo', 'No especificado'),
-                "clima": st.session_state.get('clima', 'No especificado'),
-                "morfologia": st.session_state.get('morfologia', 'No especificado')
-            },
-            "results": {
-                "emisiones_totales": float(em_total),
-                "produccion_total": float(prod_total),
-                "huella_por_kg": float(em_total / prod_total) if prod_total > 0 else 0,
-                "fecha_calculo": datetime.now().isoformat()
-            },
-            "updated_at": datetime.now().isoformat()
-        }
+        col1, col2, col3 = st.columns([1, 1, 1])
         
-        # Actualizar proyecto en Supabase
-        response = st.session_state.supabase.table("projects")\
-                                       .update(project_data)\
-                                       .eq("id", project_id)\
-                                       .execute()
+        with col2:
+            guardar = st.form_submit_button(
+                "✅ GUARDAR PROYECTO",
+                type="primary",
+                use_container_width=True
+            )
+    
+    # SOLO ejecutar guardado si se presionó el botón
+    if guardar:
+        # Actualizar nombre si cambió
+        if nuevo_nombre and nuevo_nombre != st.session_state.current_project_name:
+            st.session_state.current_project_name = nuevo_nombre
         
-        if hasattr(response, 'error') and response.error:
-            st.error(f"❌ Error de Supabase: {response.error}")
-            return False
-        
-        st.success("✅ Proyecto guardado correctamente en Supabase")
-        return True
-        
-    except Exception as e:
-        st.error(f"❌ Error inesperado al guardar: {str(e)}")
-        return False
+        # Llamar a la función de guardado controlado
+        if guardar_proyecto_completo():
+            st.rerun()  # Forzar actualización
+        else:
+            st.error("No se pudo guardar el proyecto")
+    
+    return False
 
+# =============================================================================
 # --- Factores de emisión y parámetros configurables (modificar aquí) ---
+# =============================================================================
 
 # --- Potenciales de calentamiento global (GWP) ---
 # Unidades: adimensional (relación respecto a CO2)
@@ -736,9 +1364,14 @@ opciones_labores = [
     "Riego", "Poda", "Transporte interno", "Otro"
 ]
 
+# =============================================================================
 # --- FIN DE BLOQUE DE FACTORES Y UNIDADES ---
+# =============================================================================
 
+# =============================================================================
 # --- GENERADOR DE CLAVES ÚNICAS PARA GRÁFICOS ---
+# =============================================================================
+
 if 'plot_counter' not in st.session_state:
     st.session_state.plot_counter = 0
 
@@ -751,9 +1384,11 @@ def get_unique_key():
 # =============================================================================
 
 def mostrar_sistema_usuarios():
-    """Sistema simplificado de usuarios usando Supabase - VERSIÓN CORREGIDA"""
+    """Sistema simplificado de usuarios usando Supabase - VERSIÓN COMPLETAMENTE CORREGIDA"""
     
-    # Inicializar Supabase con manejo mejorado de errores
+    # =========================================================================
+    # 1. INICIALIZACIÓN DE CONEXIÓN
+    # =========================================================================
     if 'supabase' not in st.session_state:
         st.session_state.supabase = init_supabase_connection()
     
@@ -777,7 +1412,7 @@ def mostrar_sistema_usuarios():
                 st.session_state.current_user_email = "usuario_local@ejemplo.com"
                 st.session_state.current_project_id = "local_" + str(uuid.uuid4())
                 st.session_state.current_project_name = "Proyecto Local"
-                st.session_state.supabase = None  # Marcar como sin conexión
+                st.session_state.supabase = None
                 st.rerun()
         
         st.info("""
@@ -787,24 +1422,27 @@ def mostrar_sistema_usuarios():
         - Para guardar permanentemente, necesitarás conexión a Supabase
         """)
         
-        # Si el usuario elige continuar sin conexión
         if st.session_state.get('user_authenticated', False) and st.session_state.get('supabase') is None:
             return True
         else:
             st.stop()
     
-    # Estado de la aplicación - INICIALIZACIÓN COMPLETA
-    if 'user_authenticated' not in st.session_state:
-        st.session_state.user_authenticated = False
-    if 'current_user_email' not in st.session_state:
-        st.session_state.current_user_email = None
-    if 'current_project_id' not in st.session_state:
-        st.session_state.current_project_id = None
-    if 'current_project_name' not in st.session_state:
-        st.session_state.current_project_name = None
+    # =========================================================================
+    # 2. INICIALIZACIÓN DE ESTADO
+    # =========================================================================
+    estados_requeridos = {
+        'user_authenticated': False,
+        'current_user_email': None,
+        'current_project_id': None,
+        'current_project_name': None
+    }
+    
+    for estado, valor_inicial in estados_requeridos.items():
+        if estado not in st.session_state:
+            st.session_state[estado] = valor_inicial
     
     # =========================================================================
-    # PANTALLA DE INICIO DE SESIÓN SIMPLIFICADA
+    # 3. PANTALLA DE INICIO DE SESIÓN
     # =========================================================================
     if not st.session_state.user_authenticated:
         st.markdown("---")
@@ -819,10 +1457,9 @@ def mostrar_sistema_usuarios():
                 if not user_email:
                     st.error("❌ El correo electrónico es obligatorio")
                 else:
-                    # Solo guardar el email, NO crear proyecto todavía
                     st.session_state.user_authenticated = True
                     st.session_state.current_user_email = user_email
-                    st.session_state.current_project_id = None  # Aún no hay proyecto seleccionado
+                    st.session_state.current_project_id = None
                     st.session_state.current_project_name = None
                     st.success(f"✅ ¡Bienvenido {user_email}!")
                     st.rerun()
@@ -831,20 +1468,17 @@ def mostrar_sistema_usuarios():
         **💡 ¿Primera vez?**
         - Solo ingresa tu correo electrónico
         - Después podrás crear un nuevo proyecto o cargar uno existente
-        - Todos los datos se guardarán automáticamente en la nube
+        - Todos los datos se guardarán bajo demanda cuando tú decidas
         """)
         st.stop()
     
     # =========================================================================
-    # USUARIO AUTENTICADO - ELEGIR O CREAR PROYECTO
+    # 4. SELECCIÓN O CREACIÓN DE PROYECTO
     # =========================================================================
-    
-    # Si el usuario está autenticado pero no tiene proyecto seleccionado
     if st.session_state.user_authenticated and st.session_state.current_project_id is None:
         st.markdown("---")
         st.header("📋 Selecciona o crea un proyecto")
         
-        # Obtener proyectos existentes del usuario
         user_projects = list_user_projects(st.session_state.supabase, st.session_state.current_user_email)
         
         col1, col2 = st.columns(2)
@@ -859,26 +1493,47 @@ def mostrar_sistema_usuarios():
                     if not nuevo_nombre:
                         st.error("❌ El nombre del proyecto es obligatorio")
                     else:
-                        # Crear proyecto en Supabase
-                        project_data = {
-                            "user_email": st.session_state.current_user_email,
-                            "title": nuevo_nombre,
-                            "mode": "anual",
-                            "characterization": {},
-                            "sources_data": {},
-                            "results": {},
-                            "app_version": "1.0"
+                        # CREAR NUEVO PROYECTO LOCAL
+                        st.session_state.current_project_id = str(uuid.uuid4())
+                        st.session_state.proyecto_es_local = True
+                        st.session_state.current_project_name = nuevo_nombre
+
+                        # LIMPIAR DATOS ANTERIORES COMPLETAMENTE
+                        claves_a_limpiar = []
+                        for clave in list(st.session_state.keys()):
+                            if any(clave.startswith(prefijo) for prefijo in 
+                                   ['fertilizantes_data_', 'agroquimicos_data_', 'riego_data_', 
+                                    'maquinaria_data_', 'residuos_data_', 'etapas_data_']):
+                                claves_a_limpiar.append(clave)
+                        
+                        for clave in claves_a_limpiar:
+                            try:
+                                del st.session_state[clave]
+                            except:
+                                pass
+
+                        # INICIALIZAR ESTRUCTURAS NUEVAS
+                        st.session_state.datos_confirmados = {
+                            "caracterizacion": {},
+                            "fertilizantes": {},
+                            "agroquimicos": {},
+                            "riego": {},
+                            "maquinaria": {},
+                            "residuos": {},
+                            "etapas": {}
                         }
                         
-                        project_id = save_project_to_supabase(st.session_state.supabase, project_data)
-                        
-                        if project_id:
-                            st.session_state.current_project_id = project_id
-                            st.session_state.current_project_name = nuevo_nombre
-                            st.success(f"✅ Proyecto '{nuevo_nombre}' creado!")
-                            st.rerun()
-                        else:
-                            st.error("❌ Error al crear proyecto en la nube")
+                        # ESTADO INICIAL
+                        st.session_state.guardado_pendiente = True
+                        st.session_state.modo_visualizacion = False
+                        st.session_state.em_total = 0
+                        st.session_state.prod_total = 0
+                        st.session_state.n_ciclos = 1
+                        st.session_state.ciclos_diferentes = 'No, todos los ciclos son iguales'
+
+                        st.success(f"✅ Proyecto '{nuevo_nombre}' creado en memoria!")
+                        st.info("⚠️ **Recuerda:** Usa el botón '💾 Guardar Proyecto' para guardar en la nube.")
+                        st.rerun()
         
         with col2:
             st.subheader("📂 Cargar proyecto existente")
@@ -888,131 +1543,281 @@ def mostrar_sistema_usuarios():
                     if st.button(f"📂 {project['title']}", 
                                 key=f"load_proj_{project['id']}",
                                 use_container_width=True):
-                        st.session_state.current_project_id = project['id']
-                        st.session_state.current_project_name = project['title']
-                        st.success(f"✅ Proyecto '{project['title']}' cargado!")
-                        st.rerun()
+                        
+                        # CARGAR PROYECTO COMPLETO
+                        proyecto_completo = load_project_by_id(st.session_state.supabase, project['id'])
+                        
+                        if proyecto_completo:
+                            # ESTABLECER ID Y NOMBRE
+                            st.session_state.current_project_id = project['id']
+                            st.session_state.current_project_name = project['title']
+                            
+                            # LIMPIAR DATOS ANTES DE CARGAR
+                            claves_a_limpiar = []
+                            for clave in list(st.session_state.keys()):
+                                if any(clave.startswith(prefijo) for prefijo in 
+                                       ['fertilizantes_data_', 'agroquimicos_data_', 'riego_data_', 
+                                        'maquinaria_data_', 'residuos_data_', 'etapas_data_']):
+                                    claves_a_limpiar.append(clave)
+                            
+                            for clave in claves_a_limpiar:
+                                try:
+                                    del st.session_state[clave]
+                                except:
+                                    pass
+                            
+                            # CARGAR DATOS COMPLETOS
+                            if cargar_datos_desde_proyecto(proyecto_completo):
+                                st.success(f"✅ Proyecto '{project['title']}' cargado completamente!")
+                            else:
+                                st.warning(f"⚠️ Proyecto '{project['title']}' cargado, pero algunos datos no se pudieron recuperar")
+                            
+                            st.rerun()
+                        else:
+                            st.error("❌ No se pudo cargar el proyecto")
             else:
                 st.info("No tienes proyectos guardados. Crea tu primer proyecto.")
         
         st.stop()
     
     # =========================================================================
-    # BARRA LATERAL - SOLO SE MUESTRA CUANDO HAY PROYECTO SELECCIONADO
+    # 5. BARRA LATERAL - CUANDO HAY PROYECTO SELECCIONADO
     # =========================================================================
     
     with st.sidebar:
+        # ENCABEZADO INFORMATIVO
         st.markdown(f"### 👋 Hola, {st.session_state.current_user_email}")
         st.markdown(f"**Proyecto:** {st.session_state.current_project_name}")
         
-        # Indicador de estado de conexión
+        # INDICADOR DE ESTADO
         if st.session_state.supabase is None:
             st.warning("📱 **Modo local activo**")
-            st.info("Los datos se guardan temporalmente en tu navegador")
+            st.caption("Los datos se guardan temporalmente en tu navegador")
         else:
             st.success("☁️ **Conectado a la nube**")
-            st.info("Los datos se guardan automáticamente")
+            st.caption("Los datos se guardan bajo demanda")
         
         st.markdown("---")
         
-        # Solo mostrar proyectos si hay conexión
+        # SECCIÓN DE PROYECTOS GUARDADOS (CRÍTICA - CORREGIDA)
         if st.session_state.supabase is not None:
             st.markdown("### 📁 Mis Proyectos")
             
             user_projects = list_user_projects(st.session_state.supabase, st.session_state.current_user_email)
             
             if user_projects:
-                for project in user_projects:
-                    # Resaltar el proyecto actual
+                proyectos_recientes = user_projects[:5]
+                
+                for project in proyectos_recientes:
                     if project['id'] == st.session_state.current_project_id:
-                        st.button(f"📍 {project['title']} (actual)", 
-                                 key=f"current_proj_{project['id']}",
+                        st.button(f"📍 {project['title']}", 
+                                 key=f"current_{project['id']}",
                                  use_container_width=True,
-                                 disabled=True)
+                                 disabled=True,
+                                 help="Proyecto actualmente seleccionado")
                     else:
                         if st.button(f"📂 {project['title']}", 
-                                    key=f"proj_{project['id']}",
+                                    key=f"load_{project['id']}",
                                     use_container_width=True):
+                            
+                            # =================================================
+                            # CORRECCIÓN CRÍTICA: CARGA COMPLETA DE PROYECTO
+                            # =================================================
+                            # 1. Establecer ID y nombre
                             st.session_state.current_project_id = project['id']
                             st.session_state.current_project_name = project['title']
+                            
+                            # 2. Limpiar datos anteriores
+                            claves_a_limpiar = []
+                            for clave in list(st.session_state.keys()):
+                                if any(clave.startswith(prefijo) for prefijo in 
+                                       ['fertilizantes_data_', 'agroquimicos_data_', 'riego_data_', 
+                                        'maquinaria_data_', 'residuos_data_', 'etapas_data_']):
+                                    claves_a_limpiar.append(clave)
+                            
+                            for clave in claves_a_limpiar:
+                                try:
+                                    del st.session_state[clave]
+                                except:
+                                    pass
+                            
+                            # 3. Cargar proyecto completo desde Supabase
+                            proyecto_completo = load_project_by_id(st.session_state.supabase, project['id'])
+                            
+                            if proyecto_completo:
+                                # 4. Cargar todos los datos
+                                if cargar_datos_desde_proyecto(proyecto_completo):
+                                    # 5. Establecer modo correcto
+                                    st.session_state.modo_visualizacion = True
+                                    st.session_state.proyecto_es_local = False
+                                    st.session_state.guardado_pendiente = False
+                                    
+                                    st.success(f"✅ Proyecto '{project['title']}' cargado")
+                                else:
+                                    st.warning(f"⚠️ Algunos datos no se pudieron cargar")
+                            else:
+                                st.error("❌ No se pudo cargar el proyecto desde la base de datos")
+                            
                             st.rerun()
+                
+                if len(user_projects) > 5:
+                    st.caption(f"... y {len(user_projects) - 5} proyectos más")
         
         st.markdown("---")
         
-        # Botón de guardado manual MEJORADO
-        project_id = st.session_state.get('current_project_id')
+        # =====================================================================
+        # SECCIÓN DE GUARDADO
+        # =====================================================================
+        modo_vis = st.session_state.get('modo_visualizacion', False)
+        proyecto_es_local = st.session_state.get('proyecto_es_local', True)
         
-        if st.session_state.supabase is None:
-            st.warning("📱 Sin conexión - Datos guardados localmente")
-            if st.button("🔄 Intentar reconectar", use_container_width=True):
-                st.session_state.supabase = init_supabase_connection()
-                st.rerun()
-        else:
-            # Verificar que no sea proyecto local
-            if isinstance(project_id, str) and project_id.startswith('local_'):
-                st.warning("🔓 Proyecto local - Crea nuevo proyecto para guardar en nube")
-                if st.button("🆕 Crear copia en la nube", use_container_width=True):
-                    # Crear nueva versión en la nube
-                    project_data = {
-                        "user_email": st.session_state.current_user_email,
-                        "title": st.session_state.current_project_name + " (Copia en nube)",
-                        "mode": "anual",
-                        "characterization": {},
-                        "sources_data": {},
-                        "results": {},
-                        "app_version": "1.0"
-                    }
-                    
-                    new_project_id = save_project_to_supabase(st.session_state.supabase, project_data)
-                    if new_project_id:
-                        st.session_state.current_project_id = new_project_id
-                        st.success("✅ Proyecto copiado a la nube")
-                        st.rerun()
-            else:
-                if st.button("💾 Guardar Proyecto", use_container_width=True):
-                    if guardar_proyecto_manual():
-                        st.success("✅ Proyecto guardado correctamente")
-                    else:
-                        st.error("❌ Error al guardar el proyecto")
+        st.sidebar.markdown(f"**Estado:** {'🔒 Guardado' if not proyecto_es_local else '📝 En edición'}")
         
-        # Botón para nuevo proyecto
-        if st.button("🆕 Nuevo Proyecto", use_container_width=True):
-            # Resetear para crear nuevo proyecto
-            st.session_state.current_project_id = None
-            st.session_state.current_project_name = None
-            st.rerun()
+        if proyecto_es_local and not modo_vis:
+            # MODO EDICIÓN (proyecto local no guardado)
+            st.markdown("### 💾 Guardar Proyecto")
     
-    # Si llegamos aquí, el usuario está autenticado y tiene proyecto seleccionado
+            st.warning("""
+            **⚠️ ADVERTENCIA CRÍTICA**
+    
+            Al guardar el proyecto:
+            1. **Se guardará en la nube permanentemente**
+            2. **NO podrás volver a editar** los datos ingresados
+            3. **Solo podrás visualizar** los resultados finales
+    
+            ¿Estás seguro de que todos los datos son correctos?
+            """)
+    
+            confirmar_guardado = st.checkbox(
+                "✅ **CONFIRMO** que los datos son correctos y entiendo que NO podré editarlos después",
+                value=False,
+                help="Debes marcar esta casilla para poder guardar",
+                key="confirmar_guardado_checkbox"
+            )
+            
+            nuevo_nombre = st.text_input(
+                "Renombrar proyecto (opcional)",
+                value=st.session_state.current_project_name,
+                help="Puedes cambiar el nombre antes de guardar",
+                key="renombrar_proyecto_input"
+            )
+    
+            if confirmar_guardado:
+                col1, col2, col3 = st.columns([1, 2, 1])
+                with col2:
+                    if st.button(
+                        "💾 **GUARDAR PROYECTO DEFINITIVAMENTE**",
+                        type="primary",
+                        use_container_width=True,
+                        key="boton_guardado_definitivo"
+                    ):
+                        if nuevo_nombre and nuevo_nombre != st.session_state.current_project_name:
+                            st.session_state.current_project_name = nuevo_nombre
+            
+                        if guardar_proyecto_completo():
+                            st.success("✅ Proyecto guardado correctamente!")
+                            st.session_state.modo_visualizacion = True
+                            st.session_state.proyecto_es_local = False
+                        else:
+                            st.error("❌ No se pudo guardar el proyecto")
+            else:
+                st.info("🔒 **Marque la casilla de confirmación para habilitar el guardado**")
+    
+            if st.session_state.get('guardado_pendiente', False):
+                st.info("📝 **Hay cambios sin guardar**")
+    
+            st.markdown("---")
+        else:
+            # MODO VISUALIZACIÓN (proyecto ya guardado)
+            st.success("✅ **PROYECTO GUARDADO**")
+            st.info("Este proyecto ya está guardado. Solo puedes visualizar los resultados.")
+    
+            if st.button("🆕 Crear nueva versión (copia editable)", use_container_width=True):
+                st.session_state.current_project_id = f"local_{uuid.uuid4()}"
+                st.session_state.current_project_name = f"{st.session_state.current_project_name} - Copia"
+                st.session_state.modo_visualizacion = False
+                st.session_state.proyecto_es_local = True
+                st.session_state.guardado_pendiente = True
+                st.rerun()
+    
+            st.markdown("---")
+        
+        # BOTONES DE NAVEGACIÓN
+        col_nav1, col_nav2 = st.columns(2)
+        with col_nav1:
+            if st.button("🆕 Nuevo", use_container_width=True, help="Crear nuevo proyecto vacío"):
+                st.session_state.current_project_id = None
+                st.session_state.current_project_name = None
+                st.rerun()
+        
+        with col_nav2:
+            if st.button("🏠 Inicio", use_container_width=True, type="secondary", help="Volver a la página principal"):
+                st.session_state.current_project_id = None
+                st.session_state.current_project_name = None
+                st.rerun()
+        
+        # BOTÓN DE REINICIO
+        if st.session_state.get('em_total', 0) > 0:
+            if st.button("🔄 Reiniciar cálculos", use_container_width=True, type="secondary"):
+                with st.expander("⚠️ Confirmar reinicio", expanded=True):
+                    st.warning("¿Estás seguro de reiniciar todos los cálculos?")
+                    if st.button("Sí, reiniciar todo", type="primary"):
+                        st.session_state.em_total = 0
+                        st.session_state.prod_total = 0
+                        st.session_state.emisiones_etapas = {}
+                        st.session_state.produccion_etapas = {}
+                        st.session_state.emisiones_fuentes = {k: 0 for k in st.session_state.emisiones_fuentes}
+                        st.session_state.emisiones_fuente_etapa = {}
+                        st.session_state.guardado_pendiente = True
+                        st.success("Cálculos reiniciados")
+                        st.rerun()
+    
+    # =========================================================================
+    # 6. RETORNO FINAL
+    # =========================================================================
     return True
+
+def verificar_guardado():
+    """Función temporal para verificar el guardado"""
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🔍 Diagnóstico")
+    
+    if st.sidebar.button("Ver datos a guardar"):
+        datos_prueba = {
+            "user_email": st.session_state.current_user_email,
+            "title": st.session_state.current_project_name,
+            "fertilizantes": len(st.session_state.get('fertilizantes_data', [])),
+            "agroquimicos": len(st.session_state.get('agroquimicos_data', [])),
+            "em_total": st.session_state.get('em_total', 0),
+            "prod_total": st.session_state.get('prod_total', 0)
+        }
+        st.sidebar.json(datos_prueba)
+    
+    if st.sidebar.button("Ver estructura BD"):
+        if st.session_state.supabase:
+            try:
+                response = st.session_state.supabase.table("projects").select("*").limit(1).execute()
+                if response.data:
+                    st.sidebar.write("Primer proyecto en BD:", list(response.data[0].keys()))
+            except Exception as e:
+                st.sidebar.error(f"Error: {e}")
 
 # =============================================================================
 # BARRA DE NAVEGACIÓN MEJORADA
 # =============================================================================
 
 def mostrar_navegacion():
-    """Muestra la barra de navegación en el sidebar"""
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🧭 Navegación")
-    
-    # Solo mostrar si el usuario está autenticado
-    if st.session_state.get('user_authenticated'):
-        if st.sidebar.button("🏠 Página Principal", use_container_width=True):
-            # Lógica para volver al inicio
-            st.rerun()
-        
-        if st.sidebar.button("🔄 Reiniciar Cálculos", use_container_width=True):
-            # Reiniciar variables de cálculo
-            st.session_state.em_total = 0
-            st.session_state.prod_total = 0
-            st.session_state.emisiones_etapas = {}
-            st.session_state.produccion_etapas = {}
-            st.session_state.emisiones_fuentes = {k: 0 for k in st.session_state.emisiones_fuentes}
-            st.session_state.emisiones_fuente_etapa = {}
-            st.success("Cálculos reiniciados correctamente")
-            st.rerun()
+    """Muestra la barra de navegación en el sidebar - VERSIÓN SIMPLIFICADA"""
+    # Esta función ahora está integrada en mostrar_sistema_usuarios()
+    # Se mantiene por compatibilidad, pero no hace nada
+    pass
 
 # Llamar la función de navegación
 mostrar_navegacion()
+
+# =============================================================================
+# --- DATOS DE ENTRADA Y BIENVENIDA---
+# =============================================================================
 
 # --- DATOS DE ENTRADA ---
 st.set_page_config(layout="wide")
@@ -1159,6 +1964,70 @@ def mostrar_bienvenida():
 
     st.markdown("---")
 
+# DIAGNÓSTICO TEMPORAL
+if st.session_state.get('current_project_id'):
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🐛 Debug Info")
+    
+    # Contar datos
+    count_data = {}
+    for key in st.session_state.keys():
+        if 'data' in key.lower():
+            val = st.session_state[key]
+            if isinstance(val, list):
+                count_data[key] = len(val)
+            elif val:
+                count_data[key] = 1
+    
+    st.sidebar.write("Datos encontrados:", count_data)
+    
+    if st.sidebar.button("Ver todos los datos"):
+        for key in sorted(st.session_state.keys()):
+            if 'data' in key.lower() or 'em_' in key or 'prod_' in key:
+                st.sidebar.write(f"{key}: {type(st.session_state[key])}")
+
+def formulario_solo_lectura(label, valor_actual, key=None):
+    """
+    Muestra un campo de formulario en modo solo lectura.
+    Para formularios que deben ser visibles pero no editables.
+    """
+    # Usar st.text_input con disabled=True para modo solo lectura
+    return st.text_input(
+        label,
+        value=str(valor_actual) if valor_actual else "",
+        disabled=True,
+        key=key
+    )
+
+def numero_solo_lectura(label, valor_actual, key=None):
+    """
+    Muestra un número en modo solo lectura.
+    """
+    return st.number_input(
+        label,
+        value=float(valor_actual) if valor_actual else 0.0,
+        disabled=True,
+        key=key
+    )
+
+def selectbox_solo_lectura(label, opciones, valor_actual, key=None):
+    """
+    Muestra un selectbox en modo solo lectura.
+    """
+    # Encontrar el índice del valor actual
+    if valor_actual in opciones:
+        indice = opciones.index(valor_actual)
+    else:
+        indice = 0
+    
+    return st.selectbox(
+        label,
+        options=opciones,
+        index=indice,
+        disabled=True,
+        key=key
+    )
+
 # =============================================================================
 # FLUJO PRINCIPAL DE LA APLICACIÓN
 # =============================================================================
@@ -1172,6 +2041,14 @@ if not mostrar_sistema_usuarios():
 
 # 3. Mostrar bienvenida
 mostrar_bienvenida()
+
+# 4. INICIALIZAR datos temporales si no existen
+if 'datos_temporales' not in st.session_state:
+    st.session_state.datos_temporales = {
+        "caracterizacion": {},
+        "entradas": {},
+        "calculos": {}
+    }
 
 # =============================================================================
 # INICIALIZACIÓN DE SESSION_STATE - REEMPLAZA VARIABLES GLOBALES
@@ -1207,12 +2084,54 @@ produccion_etapas = st.session_state.produccion_etapas
 emisiones_fuentes = st.session_state.emisiones_fuentes
 emisiones_fuente_etapa = st.session_state.emisiones_fuente_etapa
 
-# -----------------------------
+# =============================================================================
 # Sección 1: Caracterización General
-# -----------------------------
+# =============================================================================
 st.header("1. Caracterización General")
-cultivo = st.text_input("Nombre del cultivo o fruta")
-anual = st.radio("¿Es un cultivo anual o perenne?", ["Anual", "Perenne"])
+
+# Verificar modo visualización
+if st.session_state.get('modo_visualizacion', False):
+    # MODO VISUALIZACIÓN: Solo lectura
+    st.info("🔒 **MODO VISUALIZACIÓN** - Los datos no se pueden modificar")
+    
+    cultivo = formulario_solo_lectura("Nombre del cultivo o fruta", st.session_state.get('cultivo', ''), "cultivo_visual")
+    anual = selectbox_solo_lectura("¿Es un cultivo anual o perenne?", ["Anual", "Perenne"], 
+                                   st.session_state.get('modo_anterior', 'Anual'), "anual_visual")
+    morfologia = selectbox_solo_lectura("Morfología", ["Árbol", "Arbusto", "Hierba", "Otro"], 
+                                       st.session_state.get('morfologia', ''), "morfologia_visual")
+    ubicacion = formulario_solo_lectura("Ubicación geográfica del cultivo (región, país)", 
+                                       st.session_state.get('ubicacion', ''), "ubicacion_visual")
+    tipo_suelo = selectbox_solo_lectura("Tipo de suelo", 
+                                       ["Franco", "Arenoso", "Arcilloso", "Franco-arenoso", "Franco-arcilloso", "Otro"],
+                                       st.session_state.get('tipo_suelo', ''), "tipo_suelo_visual")
+    clima = selectbox_solo_lectura("Zona agroclimática o clima predominante",
+                                  ["Mediterráneo", "Tropical", "Templado", "Desértico", "Húmedo", "Otro"],
+                                  st.session_state.get('clima', ''), "clima_visual")
+    extra = formulario_solo_lectura("Información complementaria (opcional)", 
+                                   st.session_state.get('extra', ''), "extra_visual")
+    
+else:
+    # MODO EDICIÓN: Campos editables normales
+    cultivo = st.text_input("Nombre del cultivo o fruta", key="cultivo_edit")
+    anual = st.radio("¿Es un cultivo anual o perenne?", ["Anual", "Perenne"], key="anual_edit")
+    morfologia = st.selectbox("Morfología", ["Árbol", "Arbusto", "Hierba", "Otro"], key="morfologia_edit")
+    ubicacion = st.text_input("Ubicación geográfica del cultivo (región, país)", key="ubicacion_edit")
+    tipo_suelo = st.selectbox("Tipo de suelo", [
+        "Franco", "Arenoso", "Arcilloso", "Franco-arenoso", "Franco-arcilloso", "Otro"
+    ], key="tipo_suelo_edit")
+    clima = st.selectbox("Zona agroclimática o clima predominante", [
+        "Mediterráneo", "Tropical", "Templado", "Desértico", "Húmedo", "Otro"
+    ], key="clima_edit")
+    extra = st.text_area("Información complementaria (opcional)", key="extra_edit")
+    
+    # Guardar en session_state
+    st.session_state.cultivo = cultivo
+    st.session_state.modo_anterior = anual
+    st.session_state.morfologia = morfologia
+    st.session_state.ubicacion = ubicacion
+    st.session_state.tipo_suelo = tipo_suelo
+    st.session_state.clima = clima
+    st.session_state.extra = extra
 
 # --- Inicialización de resultados según modo anual/perenne ---
 if 'modo_anterior' not in st.session_state or st.session_state.modo_anterior != anual:
@@ -1238,26 +2157,85 @@ if 'modo_anterior' not in st.session_state or st.session_state.modo_anterior != 
 
 # Asegurar que la referencia local esté actualizada
 emisiones_fuente_etapa = st.session_state.emisiones_fuente_etapa
-morfologia = st.selectbox("Morfología", ["Árbol", "Arbusto", "Hierba", "Otro"])
-ubicacion = st.text_input("Ubicación geográfica del cultivo (región, país)")
-tipo_suelo = st.selectbox("Tipo de suelo", [
-    "Franco", "Arenoso", "Arcilloso", "Franco-arenoso", "Franco-arcilloso", "Otro"
-])
-clima = st.selectbox("Zona agroclimática o clima predominante", [
-    "Mediterráneo", "Tropical", "Templado", "Desértico", "Húmedo", "Otro"
-])
-extra = st.text_area("Información complementaria (opcional)")
 
-# -----------------------------
+# =============================================================================
 # Funciones de ingreso y cálculo
-# -----------------------------
+# =============================================================================
 
 def ingresar_fertilizantes(etapa, unidad_cantidad="ciclo"):
+    """
+    Ingresa o muestra fertilizantes.
+    VERSIÓN CON GUARDADO CONFIABLE.
+    """
+    # =====================================================================
+    # INICIALIZACIÓN OBLIGATORIA
+    # =====================================================================
+    # Asegurar que datos_confirmados exista
+    if 'datos_confirmados' not in st.session_state:
+        st.session_state.datos_confirmados = {}
+    
+    if 'fertilizantes' not in st.session_state.datos_confirmados:
+        st.session_state.datos_confirmados['fertilizantes'] = {}
+    
+    # =====================================================================
+    # VERIFICAR MODO VISUALIZACIÓN
+    # =====================================================================
+    modo_vis = st.session_state.get('modo_visualizacion', False)
+    
+    if modo_vis:
+        # MODO VISUALIZACIÓN: Mostrar resumen
+        st.markdown(f"##### Fertilizantes - {etapa}")
+        st.info("🔒 **MODO VISUALIZACIÓN** - Los datos no se pueden modificar")
+        
+        # Obtener datos confirmados
+        fertilizantes_confirmados = obtener_datos_confirmados('fertilizantes', etapa)
+        
+        if not fertilizantes_confirmados:
+            st.info("📝 No hay fertilizantes registrados para esta etapa")
+            
+            # GUARDAR LISTA VACÍA (IMPORTANTE)
+            st.session_state.datos_confirmados['fertilizantes'][etapa] = []
+            return {"fertilizantes": []}
+        
+        # Mostrar tabla resumen
+        datos_tabla = []
+        for fert in fertilizantes_confirmados:
+            if fert.get("es_organico", False):
+                datos_tabla.append({
+                    "Tipo": "Orgánico",
+                    "Nombre": fert.get("tipo", "Sin nombre"),
+                    "Cantidad (kg/ha)": format_num(fert.get("cantidad", 0)),
+                    "N (%)": format_num(fert.get("N", 0), 1),
+                    "Fracción seca": format_num(fert.get("fraccion_seca", 0) * 100 if fert.get("fraccion_seca") else 0, 1) + "%"
+                })
+            else:
+                datos_tabla.append({
+                    "Tipo": "Inorgánico",
+                    "Nombre": fert.get("tipo", ""),
+                    "Origen": fert.get("origen", "No especificado"),
+                    "Cantidad (kg/ha)": format_num(fert.get("cantidad", 0)),
+                    "N (%)": format_num(fert.get("N", 0), 1)
+                })
+        
+        if datos_tabla:
+            df = pd.DataFrame(datos_tabla)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        
+        # Los datos ya están guardados, solo retornarlos
+        return {"fertilizantes": fertilizantes_confirmados}
+    
+    # =========================================================================
+    # MODO EDICIÓN: Mostrar formularios completos
+    # =========================================================================
     st.markdown("##### Fertilizantes")
     tipos_inorg = list(factores_fertilizantes.keys())
     tipos_org = list(FACTORES_ORGANICOS.keys())
 
     sufijo = "ciclo" if unidad_cantidad == "ciclo" else "año"
+
+    # Obtener datos guardados previamente si existen
+    clave_guardado = f"fertilizantes_data_{etapa}"
+    datos_previos = st.session_state.get(clave_guardado, [])
 
     n_fert = st.number_input(
         f"Ingrese la cantidad de fertilizantes que utiliza (orgánicos e inorgánicos)",
@@ -1381,7 +2359,177 @@ def ingresar_fertilizantes(etapa, unidad_cantidad="ciclo"):
                     "es_organico": True
                 })
 
+    # =====================================================================
+    # GUARDADO OBLIGATORIO (SIEMPRE SE EJECUTA)
+    # =====================================================================
+    # Guardar SIEMPRE, incluso si la lista está vacía
+    st.session_state.datos_confirmados['fertilizantes'][etapa] = fertilizantes
+    
+    # Marcar cambios pendientes
+    st.session_state.guardado_pendiente = True
+    st.session_state.ultimo_cambio = datetime.now().isoformat()
+    
+    # Mostrar confirmación
+    if fertilizantes:
+        st.success(f"✅ {len(fertilizantes)} fertilizante(s) ingresado(s)")
+    else:
+        st.info("📝 No se ingresaron fertilizantes")
+    
     return {"fertilizantes": fertilizantes}
+
+def obtener_datos_confirmados(tipo, etapa):
+    """
+    Obtiene datos confirmados de session_state.
+    VERSIÓN SIMPLIFICADA Y CONSISTENTE.
+    """
+    try:
+        # PRIMERO: Buscar en datos_confirmados (sistema unificado)
+        if 'datos_confirmados' in st.session_state:
+            datos_confirmados = st.session_state.datos_confirmados
+            
+            # Verificar que exista el tipo y la etapa
+            if tipo in datos_confirmados and etapa in datos_confirmados[tipo]:
+                datos = datos_confirmados[tipo][etapa]
+                
+                # Para fertilizantes, agroquímicos, maquinaria: retornar lista
+                if tipo in ['fertilizantes', 'agroquimicos', 'maquinaria']:
+                    return datos if isinstance(datos, list) else []
+                
+                # Para riego, residuos: retornar diccionario completo
+                elif tipo in ['riego', 'residuos']:
+                    return datos if isinstance(datos, dict) else {}
+                
+                # Para otros tipos: retornar tal cual
+                else:
+                    return datos
+        
+        # SEGUNDO: Para compatibilidad (código antiguo)
+        clave_antigua = f"{tipo}_data_{etapa}"
+        if clave_antigua in st.session_state:
+            datos = st.session_state[clave_antigua]
+            
+            # Convertir a estructura esperada si es necesario
+            if tipo in ['fertilizantes', 'agroquimicos', 'maquinaria'] and not isinstance(datos, list):
+                return []
+            elif tipo in ['riego', 'residuos'] and not isinstance(datos, dict):
+                return {}
+            else:
+                return datos
+        
+        # TERCERO: Si no hay nada, retornar estructura vacía
+        if tipo in ['fertilizantes', 'agroquimicos', 'maquinaria']:
+            return []
+        elif tipo in ['riego', 'residuos']:
+            return {}
+        else:
+            return None
+            
+    except Exception as e:
+        # st.error(f"Error obteniendo datos confirmados: {e}")
+        # Retornar estructura vacía en caso de error
+        if tipo in ['fertilizantes', 'agroquimicos', 'maquinaria']:
+            return []
+        elif tipo in ['riego', 'residuos']:
+            return {}
+        else:
+            return None
+
+def mostrar_resumen_datos_confirmados():
+    """Muestra un resumen de los datos confirmados hasta el momento"""
+    
+    # =========================================================================
+    # VERIFICAR MODO VISUALIZACIÓN
+    # =========================================================================
+    if st.session_state.get('modo_visualizacion', False):
+        # MODO VISUALIZACIÓN: Mostrar título diferente
+        st.markdown("### 📊 Datos del Proyecto (Guardado)")
+        
+        # Mostrar mensaje importante
+        st.success("✅ **PROYECTO GUARDADO** - Solo modo visualización")
+        st.info("Este proyecto ya está guardado. Para modificar datos, crea una nueva versión desde el sidebar.")
+    else:
+        # MODO EDICIÓN: Mostrar título normal
+        st.markdown("### 📋 Resumen de datos confirmados")
+    
+    # EL RESTO DEL CÓDIGO ORIGINAL SE MANTIENE PERO CON MEJORAS:
+    if 'datos_confirmados' not in st.session_state:
+        if st.session_state.get('modo_visualizacion', False):
+            st.info("📊 No hay datos almacenados para este proyecto")
+        else:
+            st.info("📝 No hay datos confirmados todavía")
+        return
+    
+    datos = st.session_state.datos_confirmados
+    has_data = False
+    
+    # Crear una tabla más organizada
+    tabla_datos = []
+    
+    for tipo, etapas in datos.items():
+        if etapas and isinstance(etapas, dict):  # Si hay datos y es un diccionario
+            for etapa, items in etapas.items():
+                # Verificar si hay items REALES (no estructuras vacías)
+                tiene_items_reales = False
+            
+                if isinstance(items, list):
+                    # Para listas: verificar que no esté vacía
+                    if items:
+                        tiene_items_reales = True
+                        count = len(items)
+                elif isinstance(items, dict):
+                    # Para diccionarios: verificar que no sea estructura vacía
+                    # Para riego: verificar si hay actividades o emisiones
+                    if tipo == 'riego' and items:
+                        em_agua = items.get('em_agua_total', 0)
+                        em_energia = items.get('em_energia_total', 0)
+                        actividades = items.get('energia_actividades', [])
+                        tiene_items_reales = (em_agua > 0 or em_energia > 0 or 
+                                            any(a.get('agua_total_m3', 0) > 0 or 
+                                                a.get('consumo_energia', 0) > 0 
+                                                for a in actividades))
+                
+                    # Para residuos: verificar si hay biomasa
+                    elif tipo == 'residuos' and items:
+                        total_biomasa = items.get('total_biomasa', 0)
+                        tiene_items_reales = total_biomasa > 0
+                
+                    # Para otros tipos de diccionarios
+                    elif items:
+                        tiene_items_reales = True
+                
+                    count = 1 if tiene_items_reales else 0
+                else:
+                    # Para otros tipos
+                    tiene_items_reales = bool(items)
+                    count = 1 if items else 0
+            
+                if tiene_items_reales:
+                    has_data = True
+                    tipo_formateado = tipo.capitalize().replace("_", " ")
+                    st.write(f"• **{tipo_formateado}** en *{etapa}*: {count} registro(s)")
+    
+    # Para modo visualización, mostrar tabla bonita
+    if st.session_state.get('modo_visualizacion', False) and tabla_datos:
+        df = pd.DataFrame(tabla_datos)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    
+    if not has_data:
+        if st.session_state.get('modo_visualizacion', False):
+            st.info("📊 No hay datos almacenados para este proyecto")
+        else:
+            st.info("No hay datos confirmados. Ingresa y confirma datos en cada sección.")
+    
+    # Mostrar estado de guardado (solo en modo edición)
+    if not st.session_state.get('modo_visualizacion', False):
+        if st.session_state.get('guardado_pendiente', False):
+            st.warning("⚠️ Hay cambios pendientes de guardar en la nube")
+        
+        if st.session_state.get('ultimo_guardado'):
+            st.caption(f"Último guardado: {st.session_state.ultimo_guardado}")
+    else:
+        # En modo visualización, mostrar fecha del proyecto si existe
+        if st.session_state.get('ultimo_guardado'):
+            st.caption(f"📅 Proyecto guardado el: {st.session_state.ultimo_guardado}")
 
 def calcular_emisiones_n2o_fertilizantes_desglosado(fertilizantes, duracion):
     total_n_aplicado = 0
@@ -1624,7 +2772,63 @@ def calcular_emisiones_fertilizantes(fert_data, duracion):
 
     return emision_produccion, emision_co2_urea, n2o_directo_co2e, n2o_indirecto_co2e, desglose
 
+# =============================================================================
+# AGROQUÍMICOS
+# =============================================================================
+
 def ingresar_agroquimicos(etapa):
+    """
+    Ingresa o muestra agroquímicos.
+    VERSIÓN CON GUARDADO CONFIABLE.
+    """
+    # =====================================================================
+    # INICIALIZACIÓN OBLIGATORIA
+    # =====================================================================
+    if 'datos_confirmados' not in st.session_state:
+        st.session_state.datos_confirmados = {}
+    
+    if 'agroquimicos' not in st.session_state.datos_confirmados:
+        st.session_state.datos_confirmados['agroquimicos'] = {}
+    
+    # =====================================================================
+    # VERIFICAR MODO VISUALIZACIÓN
+    # =====================================================================
+    modo_vis = st.session_state.get('modo_visualizacion', False)
+    
+    if modo_vis:
+        # MODO VISUALIZACIÓN: Mostrar resumen
+        st.markdown(f"##### Agroquímicos - {etapa}")
+        st.info("🔒 **MODO VISUALIZACIÓN** - Los datos no se pueden modificar")
+        
+        agroquimicos_confirmados = obtener_datos_confirmados('agroquimicos', etapa)
+        
+        if not agroquimicos_confirmados:
+            st.info("📝 No hay agroquímicos confirmados para esta etapa")
+            
+            # GUARDAR LISTA VACÍA
+            st.session_state.datos_confirmados['agroquimicos'][etapa] = []
+            return []
+        
+        # Mostrar tabla resumen
+        datos_tabla = []
+        for agro in agroquimicos_confirmados:
+            datos_tabla.append({
+                "Nombre": agro.get("nombre_comercial", "Sin nombre"),
+                "Categoría": agro.get("categoria", ""),
+                "Tipo": agro.get("tipo", ""),
+                "Cantidad IA (kg)": format_num(agro.get("cantidad_ia", 0)),
+                "Emisiones (kg CO₂e)": format_num(agro.get("emisiones", 0))
+            })
+        
+        if datos_tabla:
+            df = pd.DataFrame(datos_tabla)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        
+        return agroquimicos_confirmados
+    
+    # =========================================================================
+    # MODO EDICIÓN: Mostrar formularios completos
+    # =========================================================================
     st.markdown("##### Agroquímicos y pesticidas")
     agroquimicos = []
     nombres_comerciales_usados = []  # Para controlar duplicados
@@ -1732,6 +2936,18 @@ def ingresar_agroquimicos(etapa):
                 "fe": fe,
                 "emisiones": emisiones
             })
+    # =====================================================================
+    # GUARDADO OBLIGATORIO
+    # =====================================================================
+    st.session_state.datos_confirmados['agroquimicos'][etapa] = agroquimicos
+    
+    # Marcar cambios
+    st.session_state.guardado_pendiente = True
+    st.session_state.ultimo_cambio = datetime.now().isoformat()
+    
+    if agroquimicos:
+        st.success(f"✅ {len(agroquimicos)} agroquímico(s) ingresado(s)")
+    
     return agroquimicos
 
 def calcular_emisiones_agroquimicos(agroquimicos, duracion):
@@ -1740,7 +2956,170 @@ def calcular_emisiones_agroquimicos(agroquimicos, duracion):
         total += ag["emisiones"] * duracion
     return total
 
-# MAQUINARIA EN PERENNES
+# =============================================================================
+# MAQUINARIA
+# =============================================================================
+
+def ingresar_maquinaria_ciclo(etapa):
+    """
+    Ingresa o muestra datos de maquinaria.
+    VERSIÓN CON GUARDADO CONFIABLE.
+    """
+    # =====================================================================
+    # INICIALIZACIÓN OBLIGATORIA
+    # =====================================================================
+    if 'datos_confirmados' not in st.session_state:
+        st.session_state.datos_confirmados = {}
+    
+    if 'maquinaria' not in st.session_state.datos_confirmados:
+        st.session_state.datos_confirmados['maquinaria'] = {}
+    
+    # =====================================================================
+    # VERIFICAR MODO VISUALIZACIÓN
+    # =====================================================================
+    modo_vis = st.session_state.get('modo_visualizacion', False)
+    
+    if modo_vis:
+        # MODO VISUALIZACIÓN
+        st.markdown(f"##### Labores y maquinaria - {etapa}")
+        st.info("🔒 **MODO VISUALIZACIÓN** - Los datos no se pueden modificar")
+        
+        labores_confirmadas = obtener_datos_confirmados('maquinaria', etapa)
+        
+        if not labores_confirmadas:
+            st.info("📝 No hay labores confirmadas para esta etapa")
+            
+            # GUARDAR LISTA VACÍA
+            st.session_state.datos_confirmados['maquinaria'][etapa] = []
+            return []
+        
+        # Mostrar tabla
+        datos_tabla = []
+        for labor in labores_confirmadas:
+            datos_tabla.append({
+                "Labor": labor.get("nombre_labor", "Sin nombre"),
+                "Maquinaria": labor.get("tipo_maquinaria", "Manual"),
+                "Combustible": labor.get("tipo_combustible", "N/A"),
+                "Consumo (L)": format_num(labor.get("litros", 0)),
+                "Emisiones (kg CO₂e)": format_num(labor.get("emisiones", 0))
+            })
+        
+        if datos_tabla:
+            df = pd.DataFrame(datos_tabla)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        
+        return labores_confirmadas
+    
+    # =========================================================================
+    # MODO EDICIÓN: Mostrar formularios completos
+    # =========================================================================
+    st.markdown("##### Labores y maquinaria")
+    labores = []
+    n_labores = st.number_input(f"¿Cuántas labores desea agregar en el ciclo?", min_value=0, step=1, key=f"num_labores_{etapa}")
+    
+    for i in range(n_labores):
+        with st.expander(f"Labor #{i+1}"):
+            nombre_labor_opcion = st.selectbox("Nombre de la labor", opciones_labores, key=f"nombre_labor_opcion_{etapa}_{i}")
+            if nombre_labor_opcion == "Otro":
+                nombre_labor = st.text_input("Ingrese el nombre de la labor", key=f"nombre_labor_otro_{etapa}_{i}")
+            else:
+                nombre_labor = nombre_labor_opcion
+
+            tipo_labor = st.radio("¿La labor es manual o mecanizada?", ["Manual", "Mecanizada"], key=f"tipo_labor_{etapa}_{i}")
+
+            if tipo_labor == "Manual":
+                st.info("Labor manual: no se considera huella de carbono directa de maquinaria ni combustible.")
+                labores.append({
+                    "nombre_labor": nombre_labor,
+                    "tipo_maquinaria": "Manual",
+                    "tipo_combustible": "N/A",
+                    "litros": 0,
+                    "emisiones": 0,
+                    "fe_personalizado": None
+                })
+            else:
+                n_maquinas = st.number_input(f"¿Cuántas maquinarias para esta labor?", min_value=1, step=1, key=f"num_maquinas_{etapa}_{i}")
+                tipos_maquinaria = list(rendimientos_maquinaria.keys())
+                for j in range(n_maquinas):
+                    if j > 0:
+                        st.markdown("---")
+                    st.markdown(f"**Maquinaria #{j+1}**")
+                    tipo_maq = st.selectbox("Tipo de maquinaria", tipos_maquinaria, key=f"tipo_maq_{etapa}_{i}_{j}")
+
+                    if tipo_maq == "Otro":
+                        nombre_maq = st.text_input("Ingrese el nombre de la maquinaria", key=f"nombre_maq_otro_{etapa}_{i}_{j}")
+                        rendimiento_recomendado = float(rendimientos_maquinaria["Otro"])
+                    else:
+                        nombre_maq = tipo_maq
+                        rendimiento_recomendado = float(rendimientos_maquinaria.get(tipo_maq, 10))
+
+                    tipo_comb = st.selectbox("Tipo de combustible", list(factores_combustible.keys()), key=f"tipo_comb_{etapa}_{i}_{j}")
+                    fe_comb_default = factores_combustible.get(tipo_comb, 0)
+
+                    repeticiones = st.number_input("Número de pasadas o repeticiones en el ciclo", min_value=1, step=1, key=f"reps_ciclo_{etapa}_{i}_{j}")
+
+                    modo = st.radio(
+                        "¿Cómo desea ingresar el consumo por pasada?",
+                        ["Litros de combustible por pasada", "Horas de uso por pasada"],
+                        key=f"modo_lab_{etapa}_{i}_{j}"
+                    )
+
+                    if modo == "Horas de uso por pasada":
+                        rendimiento = st.number_input(
+                            "Ingrese el rendimiento real de su maquinaria (litros/hora)",
+                            min_value=0.0,
+                            value=rendimiento_recomendado,
+                            step=0.1,
+                            format="%.10g",
+                            key=f"rendimiento_{etapa}_{i}_{j}"
+                        )
+                        horas = st.number_input("Horas de uso por pasada (h/ha·pasada)", min_value=0.0, format="%.10g", key=f"horas_{etapa}_{i}_{j}")
+                        litros_por_pasada = horas * rendimiento
+                    else:
+                        litros_por_pasada = st.number_input("Litros de combustible por pasada (L/ha·pasada)", min_value=0.0, format="%.10g", key=f"litros_{etapa}_{i}_{j}")
+
+                    # Permitir FE personalizado para el combustible
+                    usar_fe_personalizado = st.checkbox(
+                        "¿Desea ingresar un factor de emisión personalizado para el tipo de combustible?",
+                        key=f"usar_fe_maq_{etapa}_{i}_{j}"
+                    )
+                    if usar_fe_personalizado:
+                        fe_comb = st.number_input(
+                            "Factor de emisión personalizado (kg CO₂e/litro)",
+                            min_value=0.0,
+                            step=0.000001,
+                            format="%.10g",
+                            key=f"fe_personalizado_maq_{etapa}_{i}_{j}"
+                        )
+                    else:
+                        fe_comb = fe_comb_default
+
+                    litros_totales = litros_por_pasada * repeticiones
+                    emisiones = litros_totales * fe_comb
+
+                    labores.append({
+                        "nombre_labor": nombre_labor,
+                        "tipo_maquinaria": nombre_maq,
+                        "tipo_combustible": tipo_comb,
+                        "litros": litros_totales,
+                        "emisiones": emisiones,
+                        "fe_personalizado": fe_comb if usar_fe_personalizado else None
+                    })
+    
+    # =====================================================================
+    # GUARDADO OBLIGATORIO
+    # =====================================================================
+    st.session_state.datos_confirmados['maquinaria'][etapa] = labores
+    
+    # Marcar cambios
+    st.session_state.guardado_pendiente = True
+    st.session_state.ultimo_cambio = datetime.now().isoformat()
+    
+    if labores:
+        st.success(f"✅ {len(labores)} labor(es) ingresada(s)")
+    
+    return labores
+
 def ingresar_maquinaria_perenne(etapa, tipo_etapa):
     st.markdown(f"Labores y maquinaria ({tipo_etapa})")
     if not opciones_labores:
@@ -1898,101 +3277,6 @@ def ingresar_maquinaria_perenne(etapa, tipo_etapa):
                     })
     return labores
 
-# ====== MAQUINARIA EN ANUAL ======
-def ingresar_maquinaria_ciclo(etapa):
-    st.markdown("##### Labores y maquinaria")
-    labores = []
-    n_labores = st.number_input(f"¿Cuántas labores desea agregar en el ciclo?", min_value=0, step=1, key=f"num_labores_{etapa}")
-    for i in range(n_labores):
-        with st.expander(f"Labor #{i+1}"):
-            nombre_labor_opcion = st.selectbox("Nombre de la labor", opciones_labores, key=f"nombre_labor_opcion_{etapa}_{i}")
-            if nombre_labor_opcion == "Otro":
-                nombre_labor = st.text_input("Ingrese el nombre de la labor", key=f"nombre_labor_otro_{etapa}_{i}")
-            else:
-                nombre_labor = nombre_labor_opcion
-
-            tipo_labor = st.radio("¿La labor es manual o mecanizada?", ["Manual", "Mecanizada"], key=f"tipo_labor_{etapa}_{i}")
-
-            if tipo_labor == "Manual":
-                st.info("Labor manual: no se considera huella de carbono directa de maquinaria ni combustible.")
-                labores.append({
-                    "nombre_labor": nombre_labor,
-                    "tipo_maquinaria": "Manual",
-                    "tipo_combustible": "N/A",
-                    "litros": 0,
-                    "emisiones": 0,
-                    "fe_personalizado": None
-                })
-            else:
-                n_maquinas = st.number_input(f"¿Cuántas maquinarias para esta labor?", min_value=1, step=1, key=f"num_maquinas_{etapa}_{i}")
-                tipos_maquinaria = list(rendimientos_maquinaria.keys())
-                for j in range(n_maquinas):
-                    if j > 0:
-                        st.markdown("---")
-                    st.markdown(f"**Maquinaria #{j+1}**")
-                    tipo_maq = st.selectbox("Tipo de maquinaria", tipos_maquinaria, key=f"tipo_maq_{etapa}_{i}_{j}")
-
-                    if tipo_maq == "Otro":
-                        nombre_maq = st.text_input("Ingrese el nombre de la maquinaria", key=f"nombre_maq_otro_{etapa}_{i}_{j}")
-                        rendimiento_recomendado = float(rendimientos_maquinaria["Otro"])
-                    else:
-                        nombre_maq = tipo_maq
-                        rendimiento_recomendado = float(rendimientos_maquinaria.get(tipo_maq, 10))
-
-                    tipo_comb = st.selectbox("Tipo de combustible", list(factores_combustible.keys()), key=f"tipo_comb_{etapa}_{i}_{j}")
-                    fe_comb_default = factores_combustible.get(tipo_comb, 0)
-
-                    repeticiones = st.number_input("Número de pasadas o repeticiones en el ciclo", min_value=1, step=1, key=f"reps_ciclo_{etapa}_{i}_{j}")
-
-                    modo = st.radio(
-                        "¿Cómo desea ingresar el consumo por pasada?",
-                        ["Litros de combustible por pasada", "Horas de uso por pasada"],
-                        key=f"modo_lab_{etapa}_{i}_{j}"
-                    )
-
-                    if modo == "Horas de uso por pasada":
-                        rendimiento = st.number_input(
-                            "Ingrese el rendimiento real de su maquinaria (litros/hora)",
-                            min_value=0.0,
-                            value=rendimiento_recomendado,
-                            step=0.1,
-                            format="%.10g",
-                            key=f"rendimiento_{etapa}_{i}_{j}"
-                        )
-                        horas = st.number_input("Horas de uso por pasada (h/ha·pasada)", min_value=0.0, format="%.10g", key=f"horas_{etapa}_{i}_{j}")
-                        litros_por_pasada = horas * rendimiento
-                    else:
-                        litros_por_pasada = st.number_input("Litros de combustible por pasada (L/ha·pasada)", min_value=0.0, format="%.10g", key=f"litros_{etapa}_{i}_{j}")
-
-                    # Permitir FE personalizado para el combustible
-                    usar_fe_personalizado = st.checkbox(
-                        "¿Desea ingresar un factor de emisión personalizado para el tipo de combustible?",
-                        key=f"usar_fe_maq_{etapa}_{i}_{j}"
-                    )
-                    if usar_fe_personalizado:
-                        fe_comb = st.number_input(
-                            "Factor de emisión personalizado (kg CO₂e/litro)",
-                            min_value=0.0,
-                            step=0.000001,
-                            format="%.10g",
-                            key=f"fe_personalizado_maq_{etapa}_{i}_{j}"
-                        )
-                    else:
-                        fe_comb = fe_comb_default
-
-                    litros_totales = litros_por_pasada * repeticiones
-                    emisiones = litros_totales * fe_comb
-
-                    labores.append({
-                        "nombre_labor": nombre_labor,
-                        "tipo_maquinaria": nombre_maq,
-                        "tipo_combustible": tipo_comb,
-                        "litros": litros_totales,
-                        "emisiones": emisiones,
-                        "fe_personalizado": fe_comb if usar_fe_personalizado else None
-                    })
-    return labores
-
 def calcular_emisiones_maquinaria(labores, duracion):
     """
     Calcula las emisiones de maquinaria usando el FE personalizado si existe,
@@ -2010,7 +3294,84 @@ def calcular_emisiones_maquinaria(labores, duracion):
         total += litros * fe_utilizado
     return total * duracion
 
+# =============================================================================
+# GESTION DE RESIDUOS
+# =============================================================================
+
 def ingresar_gestion_residuos(etapa):
+    """
+    Ingresa o muestra gestión de residuos.
+    VERSIÓN CON GUARDADO CONFIABLE.
+    """
+    # =====================================================================
+    # INICIALIZACIÓN OBLIGATORIA
+    # =====================================================================
+    if 'datos_confirmados' not in st.session_state:
+        st.session_state.datos_confirmados = {}
+    
+    if 'residuos' not in st.session_state.datos_confirmados:
+        st.session_state.datos_confirmados['residuos'] = {}
+    
+    # =====================================================================
+    # VERIFICAR MODO VISUALIZACIÓN
+    # =====================================================================
+    modo_vis = st.session_state.get('modo_visualizacion', False)
+    
+    if modo_vis:
+        # MODO VISUALIZACIÓN
+        st.markdown(f"##### Gestión de residuos - {etapa}")
+        st.info("🔒 **MODO VISUALIZACIÓN** - Los datos no se pueden modificar")
+        
+        datos_residuos_completos = obtener_datos_confirmados('residuos', etapa)
+        
+        # Verificar estructura
+        if not datos_residuos_completos or not isinstance(datos_residuos_completos, dict):
+            st.info("📝 No hay gestión de residuos confirmada para esta etapa")
+            
+            # GUARDAR ESTRUCTURA VACÍA
+            st.session_state.datos_confirmados['residuos'][etapa] = {
+                "detalle": {},
+                "em_residuos": 0,
+                "detalle_emisiones": {},
+                "total_biomasa": 0
+            }
+            return 0, {}
+        
+        detalle = datos_residuos_completos.get('detalle', {})
+        
+        if not detalle:
+            st.info("No se ingresó gestión de residuos")
+            return 0, {}
+        
+        # Mostrar tabla
+        total_biomasa = datos_residuos_completos.get('total_biomasa', 0)
+        datos_tabla = []
+        
+        for metodo, datos_metodo in detalle.items():
+            if isinstance(datos_metodo, dict):
+                biomasa = datos_metodo.get("biomasa", 0)
+                porcentaje = (biomasa / total_biomasa * 100) if total_biomasa > 0 else 0
+                
+                datos_tabla.append({
+                    "Método": metodo,
+                    "Biomasa (kg)": format_num(biomasa),
+                    "Porcentaje": format_num(porcentaje, 1) + "%"
+                })
+        
+        if datos_tabla:
+            df = pd.DataFrame(datos_tabla)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        
+        em_residuos = datos_residuos_completos.get('em_residuos', 0)
+        detalle_emisiones = datos_residuos_completos.get('detalle_emisiones', {})
+        
+        st.info(f"**Total gestión de residuos:** {format_num(em_residuos)} kg CO₂e/ha")
+        
+        return em_residuos, detalle_emisiones
+    
+    # =========================================================================
+    # MODO EDICIÓN: Mostrar formularios completos
+    # =========================================================================
     # Detectar si es modo anual o perenne
     modo_perenne = "Implantacion" in etapa or "Crecimiento" in etapa or "Producción" in etapa or "produccion" in etapa.lower() or "perenne" in etapa.lower()
     if modo_perenne:
@@ -2161,10 +3522,47 @@ def ingresar_gestion_residuos(etapa):
                 sin_gestion = biomasa * (faltante / 100)
             else:
                 sin_gestion = faltante
-            detalle["Sin gestión"] = {"biomasa": sin_gestion, "ajustes": {}}
+            detalle["Sin gestion"] = {"biomasa": sin_gestion, "ajustes": {}}
 
     # Calcular emisiones y agregar al detalle
     em_residuos, detalle_emisiones = calcular_emisiones_residuos(detalle)
+    
+    # =====================================================================
+    # GUARDADO OBLIGATORIO - PERO SOLO SI HAY DATOS REALES
+    # =====================================================================
+    total_biomasa = sum(d.get("biomasa", 0) for d in detalle.values() if isinstance(d, dict))
+    
+    # SOLO guardar si hay biomasa real
+    if total_biomasa > 0 or activar == "Sí":
+        datos_residuos_completos = {
+            "detalle": detalle,
+            "em_residuos": em_residuos,
+            "detalle_emisiones": detalle_emisiones,
+            "total_biomasa": total_biomasa
+        }
+        
+        # Guardar SI hay datos reales
+        st.session_state.datos_confirmados['residuos'][etapa] = datos_residuos_completos
+        
+        # Marcar cambios
+        st.session_state.guardado_pendiente = True
+        st.session_state.ultimo_cambio = datetime.now().isoformat()
+        
+        if total_biomasa > 0:
+            st.success(f"✅ Gestión de residuos ingresada ({format_num(total_biomasa)} kg)")
+    else:
+        # NO guardar si no hay datos reales
+        # Pero asegurar que existe la estructura en datos_confirmados (vacía)
+        if 'residuos' not in st.session_state.datos_confirmados:
+            st.session_state.datos_confirmados['residuos'] = {}
+        if etapa not in st.session_state.datos_confirmados['residuos']:
+            st.session_state.datos_confirmados['residuos'][etapa] = {
+                "detalle": {},
+                "em_residuos": 0,
+                "detalle_emisiones": {},
+                "total_biomasa": 0
+            }
+    
     return em_residuos, detalle_emisiones
 
 def calcular_emisiones_residuos(detalle):
@@ -2276,7 +3674,86 @@ def calcular_emisiones_incorporacion(biomasa, fraccion_seca=None, modo="simple")
     elif modo == "avanzado":
         return 0
 
+# =============================================================================
+# RIEGO Y ENERGÍA
+# =============================================================================
+
 def ingresar_riego_ciclo(etapa):
+    """
+    Ingresa o muestra datos de riego.
+    VERSIÓN CON GUARDADO CONFIABLE.
+    """
+    # =====================================================================
+    # INICIALIZACIÓN OBLIGATORIA
+    # =====================================================================
+    if 'datos_confirmados' not in st.session_state:
+        st.session_state.datos_confirmados = {}
+    
+    if 'riego' not in st.session_state.datos_confirmados:
+        st.session_state.datos_confirmados['riego'] = {}
+    
+    # =====================================================================
+    # VERIFICAR MODO VISUALIZACIÓN
+    # =====================================================================
+    modo_vis = st.session_state.get('modo_visualizacion', False)
+    
+    if modo_vis:
+        # MODO VISUALIZACIÓN
+        st.markdown(f"##### Riego y energía - {etapa}")
+        st.info("🔒 **MODO VISUALIZACIÓN** - Los datos no se pueden modificar")
+        
+        datos_riego_completos = obtener_datos_confirmados('riego', etapa)
+        
+        # Verificar estructura
+        if not datos_riego_completos or not isinstance(datos_riego_completos, dict):
+            st.info("📝 No hay datos de riego y energía confirmados para esta etapa")
+            
+            # GUARDAR ESTRUCTURA VACÍA
+            st.session_state.datos_confirmados['riego'][etapa] = {
+                "em_agua_total": 0,
+                "em_energia_total": 0,
+                "energia_actividades": []
+            }
+            return 0, 0, []
+        
+        energia_actividades = datos_riego_completos.get('energia_actividades', [])
+        
+        if not energia_actividades:
+            st.info("📝 No hay actividades de riego registradas")
+            return 0, 0, []
+        
+        # Mostrar tabla
+        datos_tabla = []
+        for act in energia_actividades:
+            datos_tabla.append({
+                "Actividad": act.get("actividad", ""),
+                "Tipo": act.get("tipo_actividad", ""),
+                "Agua (m³)": format_num(act.get("agua_total_m3", 0)),
+                "Consumo energía": format_num(act.get("consumo_energia", 0)),
+                "Tipo energía": act.get("tipo_energia", ""),
+                "Emis. agua (kg CO₂e)": format_num(act.get("emisiones_agua", 0)),
+                "Emis. energía (kg CO₂e)": format_num(act.get("emisiones_energia", 0))
+            })
+        
+        if datos_tabla:
+            df = pd.DataFrame(datos_tabla)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        
+        em_agua_total = datos_riego_completos.get('em_agua_total', 0)
+        em_energia_total = datos_riego_completos.get('em_energia_total', 0)
+        
+        st.info(
+            f"**Resumen riego:**\n"
+            f"- Agua: {format_num(em_agua_total)} kg CO₂e/ha\n"
+            f"- Energía: {format_num(em_energia_total)} kg CO₂e/ha\n"
+            f"- **Total:** {format_num(em_agua_total + em_energia_total)} kg CO₂e/ha"
+        )
+        
+        return em_agua_total, em_energia_total, energia_actividades
+    
+    # =========================================================================
+    # MODO EDICIÓN: Mostrar formularios completos
+    # =========================================================================
     st.markdown("### Riego y energía")
     st.caption("Agregue todas las actividades de riego y energía relevantes. Para cada actividad, ingrese el consumo de agua y energía si corresponde (puede dejar en 0 si no aplica).")
 
@@ -2415,8 +3892,50 @@ def ingresar_riego_ciclo(etapa):
         f"- **Total riego y energía:** {format_num(em_agua_total + em_energia_total)} kg CO₂e/ha·ciclo"
     )
 
-    st.session_state[f"energia_actividades_{etapa}"] = energia_actividades
-
+    # =====================================================================
+    # GUARDADO OBLIGATORIO - PERO SOLO SI HAY DATOS REALES
+    # =====================================================================
+    datos_riego_completos = {
+        "em_agua_total": em_agua_total,
+        "em_energia_total": em_energia_total,
+        "energia_actividades": energia_actividades
+    }
+    
+    # SOLO guardar si hay actividades reales o consumo de agua/energía
+    tiene_datos_reales = False
+    
+    if energia_actividades:
+        # Verificar si hay consumo real (no solo estructuras vacías)
+        for actividad in energia_actividades:
+            if actividad.get("agua_total_m3", 0) > 0 or actividad.get("consumo_energia", 0) > 0:
+                tiene_datos_reales = True
+                break
+    
+    # También considerar si hay emisiones calculadas
+    if em_agua_total > 0 or em_energia_total > 0:
+        tiene_datos_reales = True
+    
+    if tiene_datos_reales:
+        # Guardar SI hay datos reales
+        st.session_state.datos_confirmados['riego'][etapa] = datos_riego_completos
+        
+        # Marcar cambios
+        st.session_state.guardado_pendiente = True
+        st.session_state.ultimo_cambio = datetime.now().isoformat()
+        
+        st.success(f"✅ {len(energia_actividades)} actividad(es) de riego ingresada(s)")
+    else:
+        # NO guardar si no hay datos reales
+        # Pero asegurar que existe la estructura en datos_confirmados (vacía)
+        if 'riego' not in st.session_state.datos_confirmados:
+            st.session_state.datos_confirmados['riego'] = {}
+        if etapa not in st.session_state.datos_confirmados['riego']:
+            st.session_state.datos_confirmados['riego'][etapa] = {
+                "em_agua_total": 0,
+                "em_energia_total": 0,
+                "energia_actividades": []
+            }
+    
     return em_agua_total, em_energia_total, energia_actividades
 
 def ingresar_riego_implantacion(etapa):
@@ -2876,6 +4395,719 @@ def ingresar_riego_crecimiento(etapa, duracion, permitir_cambio_sistema=False):
 
     # Retornar valores ya multiplicados por la duración para mantener compatibilidad
     return em_agua_total * duracion, em_energia_total * duracion, energia_actividades
+
+# =============================================================================
+# MODO DE ANÁLISIS ANUAL
+# =============================================================================
+
+def etapa_anual():
+    # =========================================================================
+    # VERIFICAR MODO VISUALIZACIÓN
+    # =========================================================================
+    if st.session_state.get('modo_visualizacion', False):
+        # MODO VISUALIZACIÓN: Recrear la interfaz de ingreso COMPLETA en modo solo lectura.
+        st.header("📋 Ingreso de Datos - Ciclo Anual (Guardado)")
+        st.success("✅ **PROYECTO GUARDADO** - Solo modo visualización")
+        st.info("Estos son los datos que ingresaste. Para modificarlos, crea una nueva versión desde el sidebar.")
+        st.markdown("---")
+
+        # Intentar recuperar la configuración de ciclos desde los datos guardados.
+        # Si no existen, mostrar valores por defecto o campos vacíos en solo lectura.
+        # NOTA: Esta información debe estar guardada en session_state o en los datos confirmados para reconstruirse.
+        # Se asume que 'n_ciclos' y 'ciclos_diferentes' se guardaron previamente.
+        n_ciclos_guardado = st.session_state.get('n_ciclos', 1)
+        ciclos_diferentes_guardado = st.session_state.get('ciclos_diferentes', 'No, todos los ciclos son iguales')
+
+        # Mostrar la configuración de ciclos en solo lectura.
+        st.markdown("#### Configuración de Ciclos")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.text_input("¿Cuántos ciclos realiza por año?", value=str(n_ciclos_guardado), disabled=True, key="info_n_ciclos")
+        with col2:
+            opciones = ["No, todos los ciclos son iguales", "Sí, cada ciclo es diferente"]
+            indice = opciones.index(ciclos_diferentes_guardado) if ciclos_diferentes_guardado in opciones else 0
+            st.selectbox("¿Los ciclos son diferentes entre sí?", options=opciones, index=indice, disabled=True, key="info_ciclos_diferentes")
+
+        if ciclos_diferentes_guardado == "No, todos los ciclos son iguales":
+            st.info(f"Se aplicarán los mismos datos del 'ciclo_tipico' a los {n_ciclos_guardado} ciclo(s).")
+        else:
+            st.info(f"Ingresó datos específicos para cada uno de los {n_ciclos_guardado} ciclo(s).")
+
+        em_total_viz = 0
+        prod_total_viz = 0
+
+        # --- LÓGICA PRINCIPAL PARA MOSTRAR FORMULARIOS BLOQUEADOS ---
+        if ciclos_diferentes_guardado == "No, todos los ciclos son iguales":
+            st.markdown("### Datos del Ciclo Típico")
+            
+            # 1. Producción (si existe en datos guardados)
+            prod_guardada = st.session_state.get('prod_total_por_ciclo_tipico', 0) # Necesitarías guardar este dato
+            if prod_guardada and n_ciclos_guardado > 1:
+                prod_guardada = prod_guardada / n_ciclos_guardado # Ajustar para mostrar por ciclo
+            produccion_viz = st.number_input("Producción de fruta en el ciclo (kg/ha·ciclo)", min_value=0.0, value=float(prod_guardada), disabled=True, key="viz_prod_ciclo_tipico")
+            
+            st.markdown("---")
+            st.subheader("Fertilizantes")
+            # Esta función, al estar en modo visualización, mostrará los datos confirmados de 'ciclo_tipico' en una tabla.
+            ingresar_fertilizantes("ciclo_tipico", unidad_cantidad="ciclo")
+            
+            st.markdown("---")
+            st.subheader("Agroquímicos y pesticidas")
+            ingresar_agroquimicos("ciclo_tipico")
+            
+            st.markdown("---")
+            st.subheader("Riego")
+            # Estas funciones retornan valores, pero en modo visualización también mostrarán tablas.
+            ingresar_riego_ciclo("ciclo_tipico")
+            
+            st.markdown("---")
+            st.subheader("Labores y maquinaria")
+            ingresar_maquinaria_ciclo("ciclo_tipico")
+            
+            st.markdown("---")
+            st.subheader("Gestión de residuos")
+            ingresar_gestion_residuos("ciclo_tipico")
+
+            # Calcular totales para retornar (usando datos de session_state)
+            em_total_viz = st.session_state.get('em_total', 0)
+            prod_total_viz = st.session_state.get('prod_total', 0)
+
+        else:
+            # Lógica para ciclos diferentes en modo visualización
+            total_fert_viz = 0
+            total_agroq_viz = 0
+            total_riego_viz = 0
+            total_maq_viz = 0
+            total_res_viz = 0
+            
+            # Se asume que 'n_ciclos_guardado' es correcto.
+            for i in range(int(n_ciclos_guardado)):
+                ciclo_num = i + 1
+                st.markdown(f"### Ciclo {ciclo_num}")
+                
+                # Producción por ciclo (si está guardada)
+                prod_key = f'prod_ciclo_{ciclo_num}'
+                prod_ciclo_guardada = st.session_state.get(prod_key, 0)
+                st.number_input(f"Producción de fruta en el ciclo {ciclo_num} (kg/ha·ciclo)", min_value=0.0, value=float(prod_ciclo_guardada), disabled=True, key=f"viz_prod_ciclo_{ciclo_num}")
+
+                st.subheader("Fertilizantes")
+                ingresar_fertilizantes(f"ciclo_{ciclo_num}", unidad_cantidad="ciclo")
+                
+                st.subheader("Agroquímicos y pesticidas")
+                ingresar_agroquimicos(f"ciclo_{ciclo_num}")
+                
+                st.subheader("Riego")
+                ingresar_riego_ciclo(f"ciclo_{ciclo_num}")
+                
+                st.subheader("Labores y maquinaria")
+                ingresar_maquinaria_ciclo(f"ciclo_{ciclo_num}")
+                
+                st.subheader("Gestión de residuos")
+                ingresar_gestion_residuos(f"ciclo_{ciclo_num}")
+                
+                if i < int(n_ciclos_guardado) - 1: # No poner línea después del último ciclo
+                    st.markdown("---")
+
+            # Los totales se obtienen del session_state, que debería estar actualizado si los datos se cargaron correctamente.
+            em_total_viz = st.session_state.get('em_total', 0)
+            prod_total_viz = st.session_state.get('prod_total', 0)
+
+        st.markdown("---")
+        st.info("📊 **Los resultados calculados están en la pestaña 'Resultados'**")
+        
+        # Retornar los valores guardados (para que la pestaña Resultados funcione)
+        return em_total_viz, prod_total_viz
+    
+    # =========================================================================
+    # MODO EDICIÓN: Solo formularios editables (sin cálculos intermedios)
+    # =========================================================================
+    st.header("📝 Ingreso de Datos - Ciclo Anual")
+    
+    # === VERIFICAR SI HAY DATOS GUARDADOS Y CARGARLOS ===
+    if 'resultados_globales' in st.session_state:
+        # Si ya hay resultados calculados, usarlos directamente
+        resultados = st.session_state.resultados_globales
+        em_total = resultados.get('em_total', 0)
+        prod_total = resultados.get('prod_total', 0)
+        
+        # Mostrar que los datos están cargados
+        st.success("✅ Datos del proyecto cargados desde la memoria")
+    
+    # === MOSTRAR RESUMEN DE DATOS CONFIRMADOS ===
+    mostrar_resumen_datos_confirmados()
+    st.markdown("---")
+    
+    n_ciclos = st.number_input("¿Cuántos ciclos realiza por año?", min_value=1, step=1, key="n_ciclos")
+    ciclos_diferentes = st.radio(
+        "¿Los ciclos son diferentes entre sí?",
+        ["No, todos los ciclos son iguales", "Sí, cada ciclo es diferente"],
+        key="ciclos_diferentes"
+    )
+    if ciclos_diferentes == "No, todos los ciclos son iguales":
+        st.info(
+            f"""
+            Todos los datos que ingrese a continuación se **asumirán iguales para cada ciclo** y se multiplicarán por {n_ciclos} ciclos.
+            Es decir, el sistema considerará que en todos los ciclos usted mantiene los mismos consumos, actividades y hábitos de manejo.
+            Si existen diferencias importantes entre ciclos, le recomendamos ingresar el detalle ciclo por ciclo.
+            """
+        )
+    else:
+        st.info(
+            "Ingrese los datos correspondientes a cada ciclo. El sistema sumará los valores de todos los ciclos, permitiendo reflejar cambios o variaciones entre ciclos."
+        )
+
+    em_total = 0
+    prod_total = 0
+    emisiones_ciclos = []
+    desglose_fuentes_ciclos = []
+
+    if ciclos_diferentes == "No, todos los ciclos son iguales":
+        st.markdown("### Datos para un ciclo típico (se multiplicará por el número de ciclos)")
+        produccion = st.number_input("Producción de fruta en el ciclo (kg/ha·ciclo)", min_value=0.0, key="prod_ciclo_tipico")
+        
+        st.markdown("---")
+        st.subheader("Fertilizantes")
+        # Ingresar fertilizantes (los cálculos se hacen internamente)
+        fert = ingresar_fertilizantes("ciclo_tipico", unidad_cantidad="ciclo")
+        
+        st.markdown("---")
+        st.subheader("Agroquímicos y pesticidas")
+        # Ingresar agroquímicos (los cálculos se hacen internamente)
+        agroq = ingresar_agroquimicos("ciclo_tipico")
+        
+        st.markdown("---")
+        st.subheader("Riego")
+        # Ingresar riego (los cálculos se hacen internamente)
+        em_agua, em_energia, energia_actividades = ingresar_riego_ciclo("ciclo_tipico")
+        tipo_riego = st.session_state.get("tipo_riego_ciclo_tipico", "")
+        
+        st.markdown("---")
+        st.subheader("Labores y maquinaria")
+        # Ingresar maquinaria (los cálculos se hacen internamente)
+        labores = ingresar_maquinaria_ciclo("ciclo_tipico")
+        
+        st.markdown("---")
+        st.subheader("Gestión de residuos")
+        # Ingresar residuos (los cálculos se hacen internamente)
+        em_residuos, detalle_residuos = ingresar_gestion_residuos("ciclo_tipico")
+        
+        # OBTENER DATOS CONFIRMADOS para cálculos finales
+        fertilizantes_confirmados = obtener_datos_confirmados('fertilizantes', 'ciclo_tipico')
+        agroquimicos_confirmados = obtener_datos_confirmados('agroquimicos', 'ciclo_tipico')
+        
+        # Calcular emisiones (solo para guardar, NO mostrar)
+        if fertilizantes_confirmados:
+            em_fert_prod, em_fert_co2_urea, em_fert_n2o_dir, em_fert_n2o_ind, desglose_fert = calcular_emisiones_fertilizantes(
+                {"fertilizantes": fertilizantes_confirmados}, 1
+            )
+            em_fert_total = em_fert_prod + em_fert_co2_urea + em_fert_n2o_dir + em_fert_n2o_ind
+        else:
+            em_fert_prod = em_fert_co2_urea = em_fert_n2o_dir = em_fert_n2o_ind = 0
+            em_fert_total = 0
+            desglose_fert = []
+        
+        if agroquimicos_confirmados:
+            em_agroq = calcular_emisiones_agroquimicos(agroquimicos_confirmados, 1)
+        else:
+            em_agroq = 0
+        
+        if labores:
+            em_maq = calcular_emisiones_maquinaria(labores, 1)
+        else:
+            em_maq = 0
+        
+        # Solo calcular si hay datos confirmados
+        if fertilizantes_confirmados or agroquimicos_confirmados or labores:
+            em_ciclo = em_fert_total + em_agroq + em_agua + em_energia + em_maq + em_residuos
+            em_total = em_ciclo * n_ciclos
+            prod_total = produccion * n_ciclos
+            
+            for ciclo in range(1, int(n_ciclos) + 1):
+                desglose_fuentes_ciclos.append({
+                    "Ciclo": ciclo,
+                    "Fertilizantes": em_fert_total,
+                    "Agroquímicos": em_agroq,
+                    "Riego": em_agua + em_energia,
+                    "Maquinaria": em_maq,
+                    "Residuos": em_residuos,
+                    "desglose_fertilizantes": desglose_fert,
+                    "desglose_agroquimicos": agroquimicos_confirmados if agroquimicos_confirmados else [],
+                    "desglose_maquinaria": labores,
+                    "desglose_riego": {
+                        "tipo_riego": tipo_riego,
+                        "emisiones_agua": em_agua,
+                        "emisiones_energia": em_energia,
+                        "energia_actividades": energia_actividades
+                    },
+                    "desglose_residuos": detalle_residuos
+                })
+                emisiones_ciclos.append((ciclo, em_ciclo, produccion))
+
+            # Guardar en variables globales (session_state)
+            st.session_state.emisiones_fuentes["Fertilizantes"] = em_fert_total * n_ciclos
+            st.session_state.emisiones_fuentes["Agroquímicos"] = em_agroq * n_ciclos
+            st.session_state.emisiones_fuentes["Riego"] = (em_agua + em_energia) * n_ciclos
+            st.session_state.emisiones_fuentes["Maquinaria"] = em_maq * n_ciclos
+            st.session_state.emisiones_fuentes["Residuos"] = em_residuos * n_ciclos
+
+            # Guardar resultados en session_state
+            st.session_state.emisiones_etapas["Anual"] = em_total
+            st.session_state.produccion_etapas["Anual"] = prod_total
+            st.session_state.emisiones_fuente_etapa["Anual"] = {
+                "Fertilizantes": st.session_state.emisiones_fuentes["Fertilizantes"],
+                "Agroquímicos": st.session_state.emisiones_fuentes["Agroquímicos"],
+                "Riego": st.session_state.emisiones_fuentes["Riego"],
+                "Maquinaria": st.session_state.emisiones_fuentes["Maquinaria"],
+                "Residuos": st.session_state.emisiones_fuentes["Residuos"]
+            }
+        
+        # Mensaje informativo (sin cálculos detallados)
+        if fertilizantes_confirmados or agroquimicos_confirmados or labores:
+            st.info("✅ Datos ingresados correctamente. Ve a la pestaña 'Resultados' para ver los cálculos completos.")
+        else:
+            st.info("📝 Ingresa y confirma los datos en cada sección para poder calcular la huella de carbono.")
+
+    else:
+        total_fert = 0
+        total_agroq = 0
+        total_riego = 0
+        total_maq = 0
+        total_res = 0
+        
+        for i in range(int(n_ciclos)):
+            st.markdown(f"### Ciclo {i+1}")
+            produccion = st.number_input(f"Producción de fruta en el ciclo {i+1} (kg/ha·ciclo)", min_value=0.0, key=f"prod_ciclo_{i+1}")
+
+            st.subheader("Fertilizantes")
+            fert = ingresar_fertilizantes(f"ciclo_{i+1}", unidad_cantidad="ciclo")
+            
+            st.subheader("Agroquímicos y pesticidas")
+            agroq = ingresar_agroquimicos(f"ciclo_{i+1}")
+            
+            st.subheader("Riego")
+            em_agua, em_energia, energia_actividades = ingresar_riego_ciclo(f"ciclo_{i+1}")
+            tipo_riego = st.session_state.get(f"tipo_riego_ciclo_{i+1}", "")
+            
+            st.subheader("Labores y maquinaria")
+            labores = ingresar_maquinaria_ciclo(f"ciclo_{i+1}")
+            
+            st.subheader("Gestión de residuos")
+            em_residuos, detalle_residuos = ingresar_gestion_residuos(f"ciclo_{i+1}")
+            
+            # OBTENER DATOS CONFIRMADOS para cálculos finales
+            fertilizantes_confirmados = obtener_datos_confirmados('fertilizantes', f'ciclo_{i+1}')
+            agroquimicos_confirmados = obtener_datos_confirmados('agroquimicos', f'ciclo_{i+1}')
+            
+            # Calcular emisiones (solo para guardar, NO mostrar)
+            if fertilizantes_confirmados:
+                em_fert_prod, em_fert_co2_urea, em_fert_n2o_dir, em_fert_n2o_ind, desglose_fert = calcular_emisiones_fertilizantes(
+                    {"fertilizantes": fertilizantes_confirmados}, 1
+                )
+                em_fert_total = em_fert_prod + em_fert_co2_urea + em_fert_n2o_dir + em_fert_n2o_ind
+            else:
+                em_fert_prod = em_fert_co2_urea = em_fert_n2o_dir = em_fert_n2o_ind = 0
+                em_fert_total = 0
+                desglose_fert = []
+            
+            if agroquimicos_confirmados:
+                em_agroq = calcular_emisiones_agroquimicos(agroquimicos_confirmados, 1)
+            else:
+                em_agroq = 0
+            
+            if labores:
+                em_maq = calcular_emisiones_maquinaria(labores, 1)
+            else:
+                em_maq = 0
+            
+            # Solo sumar si hay datos confirmados
+            if fertilizantes_confirmados or agroquimicos_confirmados or labores:
+                em_ciclo = em_fert_total + em_agroq + em_agua + em_energia + em_maq + em_residuos
+                em_total += em_ciclo
+                prod_total += produccion
+                
+                desglose_fuentes_ciclos.append({
+                    "Ciclo": i+1,
+                    "Fertilizantes": em_fert_total,
+                    "Agroquímicos": em_agroq,
+                    "Riego": em_agua + em_energia,
+                    "Maquinaria": em_maq,
+                    "Residuos": em_residuos,
+                    "desglose_fertilizantes": desglose_fert,
+                    "desglose_agroquimicos": agroquimicos_confirmados if agroquimicos_confirmados else [],
+                    "desglose_maquinaria": labores,
+                    "desglose_riego": {
+                        "tipo_riego": tipo_riego,
+                        "emisiones_agua": em_agua,
+                        "emisiones_energia": em_energia,
+                        "energia_actividades": energia_actividades
+                    },
+                    "desglose_residuos": detalle_residuos
+                })
+                emisiones_ciclos.append((i+1, em_ciclo, produccion))
+
+                total_fert += em_fert_total
+                total_agroq += em_agroq
+                total_riego += em_agua + em_energia
+                total_maq += em_maq
+                total_res += em_residuos
+            
+            # Mensaje informativo por ciclo
+            if fertilizantes_confirmados or agroquimicos_confirmados or labores:
+                st.info(f"✅ Datos del ciclo {i+1} ingresados correctamente.")
+            else:
+                st.info(f"📝 Ingresa y confirma los datos para el ciclo {i+1}.")
+
+        # Solo guardar si hay datos
+        if total_fert > 0 or total_agroq > 0 or total_riego > 0 or total_maq > 0 or total_res > 0:
+            st.session_state.emisiones_fuentes["Fertilizantes"] = total_fert
+            st.session_state.emisiones_fuentes["Agroquímicos"] = total_agroq
+            st.session_state.emisiones_fuentes["Riego"] = total_riego
+            st.session_state.emisiones_fuentes["Maquinaria"] = total_maq
+            st.session_state.emisiones_fuentes["Residuos"] = total_res
+
+            st.session_state.emisiones_etapas["Anual"] = em_total
+            st.session_state.produccion_etapas["Anual"] = prod_total
+            st.session_state.emisiones_fuente_etapa["Anual"] = {
+                "Fertilizantes": st.session_state.emisiones_fuentes["Fertilizantes"],
+                "Agroquímicos": st.session_state.emisiones_fuentes["Agroquímicos"],
+                "Riego": st.session_state.emisiones_fuentes["Riego"],
+                "Maquinaria": st.session_state.emisiones_fuentes["Maquinaria"],
+                "Residuos": st.session_state.emisiones_fuentes["Residuos"]
+            }
+        
+        # Mensaje final informativo
+        if em_total > 0:
+            st.success("✅ Todos los ciclos han sido ingresados. Ve a la pestaña 'Resultados' para ver los cálculos completos.")
+
+    # Guardar siempre (incluso si está vacío) para mantener la estructura
+    st.session_state["emisiones_ciclos"] = emisiones_ciclos
+    st.session_state["desglose_fuentes_ciclos"] = desglose_fuentes_ciclos
+    
+    # Actualizar em_total y prod_total en session_state
+    st.session_state.em_total = em_total
+    st.session_state.prod_total = prod_total
+    
+    return em_total, prod_total
+    
+    # =========================================================================
+    # MODO EDICIÓN: Flujo completo con formularios
+    # =========================================================================
+    st.header("Ciclo anual")
+    
+    # === VERIFICAR SI HAY DATOS GUARDADOS Y CARGARLOS ===
+    if 'resultados_globales' in st.session_state:
+        # Si ya hay resultados calculados, usarlos directamente
+        resultados = st.session_state.resultados_globales
+        em_total = resultados.get('em_total', 0)
+        prod_total = resultados.get('prod_total', 0)
+        
+        # Mostrar que los datos están cargados
+        st.success("✅ Datos del proyecto cargados desde la memoria")
+        
+        # Continuar con la lógica normal, pero sin recalcular desde cero
+        # (mostrar los resultados existentes)
+    
+    # === MOSTRAR RESUMEN DE DATOS CONFIRMADOS ===
+    mostrar_resumen_datos_confirmados()
+    st.markdown("---")
+    
+    n_ciclos = st.number_input("¿Cuántos ciclos realiza por año?", min_value=1, step=1, key="n_ciclos")
+    ciclos_diferentes = st.radio(
+        "¿Los ciclos son diferentes entre sí?",
+        ["No, todos los ciclos son iguales", "Sí, cada ciclo es diferente"],
+        key="ciclos_diferentes"
+    )
+    if ciclos_diferentes == "No, todos los ciclos son iguales":
+        st.info(
+            f"""
+            Todos los datos que ingrese a continuación se **asumirán iguales para cada ciclo** y se multiplicarán por {n_ciclos} ciclos.
+            Es decir, el sistema considerará que en todos los ciclos usted mantiene los mismos consumos, actividades y hábitos de manejo.
+            Si existen diferencias importantes entre ciclos, le recomendamos ingresar el detalle ciclo por ciclo.
+            """
+        )
+    else:
+        st.info(
+            "Ingrese los datos correspondientes a cada ciclo. El sistema sumará los valores de todos los ciclos, permitiendo reflejar cambios o variaciones entre ciclos."
+        )
+
+    em_total = 0
+    prod_total = 0
+    emisiones_ciclos = []
+    desglose_fuentes_ciclos = []
+
+    if ciclos_diferentes == "No, todos los ciclos son iguales":
+        st.markdown("### Datos para un ciclo típico (se multiplicará por el número de ciclos)")
+        produccion = st.number_input("Producción de fruta en el ciclo (kg/ha·ciclo)", min_value=0.0, key="prod_ciclo_tipico")
+        
+        st.markdown("---")
+        st.subheader("Fertilizantes")
+        fert = ingresar_fertilizantes("ciclo_tipico", unidad_cantidad="ciclo")
+        
+        # OBTENER DATOS CONFIRMADOS para cálculos
+        fertilizantes_confirmados = obtener_datos_confirmados('fertilizantes', 'ciclo_tipico')
+        
+        if fertilizantes_confirmados:
+            em_fert_prod, em_fert_co2_urea, em_fert_n2o_dir, em_fert_n2o_ind, desglose_fert = calcular_emisiones_fertilizantes(
+                {"fertilizantes": fertilizantes_confirmados}, 1
+            )
+            em_fert_total = em_fert_prod + em_fert_co2_urea + em_fert_n2o_dir + em_fert_n2o_ind
+            st.info(
+                f"**Fertilizantes (por ciclo):**\n"
+                f"- Producción de fertilizantes: {format_num(em_fert_prod)} kg CO₂e/ha·ciclo\n"
+                f"- Emisiones CO₂ por hidrólisis de urea: {format_num(em_fert_co2_urea)} kg CO₂e/ha·ciclo\n"
+                f"- Emisiones directas N₂O: {format_num(em_fert_n2o_dir)} kg CO₂e/ha·ciclo\n"
+                f"- Emisiones indirectas N₂O: {format_num(em_fert_n2o_ind)} kg CO₂e/ha·ciclo\n"
+                f"- **Total fertilizantes:** {format_num(em_fert_total)} kg CO₂e/ha·ciclo"
+            )
+        else:
+            st.info("ℹ️ Ingrese y confirme los fertilizantes para ver los cálculos")
+            em_fert_prod = em_fert_co2_urea = em_fert_n2o_dir = em_fert_n2o_ind = 0
+            em_fert_total = 0
+            desglose_fert = []
+
+        st.markdown("---")
+        st.subheader("Agroquímicos y pesticidas")
+        agroq = ingresar_agroquimicos("ciclo_tipico")
+        
+        # OBTENER DATOS CONFIRMADOS para cálculos
+        agroquimicos_confirmados = obtener_datos_confirmados('agroquimicos', 'ciclo_tipico')
+        
+        if agroquimicos_confirmados:
+            em_agroq = calcular_emisiones_agroquimicos(agroquimicos_confirmados, 1)
+            st.info(
+                f"**Agroquímicos (por ciclo):**\n"
+                f"- **Total agroquímicos:** {format_num(em_agroq)} kg CO₂e/ha·ciclo"
+            )
+        else:
+            st.info("ℹ️ Ingrese y confirme los agroquímicos para ver los cálculos")
+            em_agroq = 0
+            agroq = []
+
+        st.markdown("---")
+        st.subheader("Riego")
+        em_agua, em_energia, energia_actividades = ingresar_riego_ciclo("ciclo_tipico")
+        tipo_riego = st.session_state.get("tipo_riego_ciclo_tipico", "")
+
+        st.markdown("---")
+        st.subheader("Labores y maquinaria")
+        labores = ingresar_maquinaria_ciclo("ciclo_tipico")
+        
+        # OBTENER DATOS CONFIRMADOS para cálculos (si aplica)
+        # Nota: ingresar_maquinaria_ciclo ya retorna los datos, así que usamos directamente
+        if labores:
+            em_maq = calcular_emisiones_maquinaria(labores, 1)
+            st.info(
+                f"**Maquinaria (por ciclo):**\n"
+                f"- **Total maquinaria:** {format_num(em_maq)} kg CO₂e/ha·ciclo"
+            )
+        else:
+            st.info("ℹ️ Ingrese labores y maquinaria para ver los cálculos")
+            em_maq = 0
+
+        em_residuos, detalle_residuos = ingresar_gestion_residuos("ciclo_tipico")
+        st.info(
+            f"**Gestión de residuos (por ciclo):**\n"
+            f"- **Total gestión de residuos:** {format_num(em_residuos)} kg CO₂e/ha·ciclo"
+        )
+
+        # Solo calcular si hay datos confirmados
+        if fertilizantes_confirmados or agroquimicos_confirmados or labores:
+            em_ciclo = em_fert_total + em_agroq + em_agua + em_energia + em_maq + em_residuos
+            em_total = em_ciclo * n_ciclos
+            prod_total = produccion * n_ciclos
+            
+            for ciclo in range(1, int(n_ciclos) + 1):
+                desglose_fuentes_ciclos.append({
+                    "Ciclo": ciclo,
+                    "Fertilizantes": em_fert_total,
+                    "Agroquímicos": em_agroq,
+                    "Riego": em_agua + em_energia,
+                    "Maquinaria": em_maq,
+                    "Residuos": em_residuos,
+                    "desglose_fertilizantes": desglose_fert,
+                    "desglose_agroquimicos": agroquimicos_confirmados if agroquimicos_confirmados else [],
+                    "desglose_maquinaria": labores,
+                    "desglose_riego": {
+                        "tipo_riego": tipo_riego,
+                        "emisiones_agua": em_agua,
+                        "emisiones_energia": em_energia,
+                        "energia_actividades": energia_actividades
+                    },
+                    "desglose_residuos": detalle_residuos
+                })
+                emisiones_ciclos.append((ciclo, em_ciclo, produccion))
+
+            # Guardar en variables globales (session_state)
+            st.session_state.emisiones_fuentes["Fertilizantes"] = em_fert_total * n_ciclos
+            st.session_state.emisiones_fuentes["Agroquímicos"] = em_agroq * n_ciclos
+            st.session_state.emisiones_fuentes["Riego"] = (em_agua + em_energia) * n_ciclos
+            st.session_state.emisiones_fuentes["Maquinaria"] = em_maq * n_ciclos
+            st.session_state.emisiones_fuentes["Residuos"] = em_residuos * n_ciclos
+
+            st.info(f"Huella de carbono por ciclo típico: {format_num(em_ciclo)} kg CO₂e/ha·ciclo")
+            st.info(f"Huella de carbono anual (todos los ciclos): {format_num(em_total)} kg CO₂e/ha·año")
+
+            # Guardar resultados en session_state
+            st.session_state.emisiones_etapas["Anual"] = em_total
+            st.session_state.produccion_etapas["Anual"] = prod_total
+            st.session_state.emisiones_fuente_etapa["Anual"] = {
+                "Fertilizantes": st.session_state.emisiones_fuentes["Fertilizantes"],
+                "Agroquímicos": st.session_state.emisiones_fuentes["Agroquímicos"],
+                "Riego": st.session_state.emisiones_fuentes["Riego"],
+                "Maquinaria": st.session_state.emisiones_fuentes["Maquinaria"],
+                "Residuos": st.session_state.emisiones_fuentes["Residuos"]
+            }
+        else:
+            st.warning("⚠️ Confirma los datos en cada sección para ver los cálculos completos")
+
+    else:
+        total_fert = 0
+        total_agroq = 0
+        total_riego = 0
+        total_maq = 0
+        total_res = 0
+        
+        for i in range(int(n_ciclos)):
+            st.markdown(f"### Ciclo {i+1}")
+            produccion = st.number_input(f"Producción de fruta en el ciclo {i+1} (kg/ha·ciclo)", min_value=0.0, key=f"prod_ciclo_{i+1}")
+
+            st.subheader("Fertilizantes")
+            fert = ingresar_fertilizantes(f"ciclo_{i+1}", unidad_cantidad="ciclo")
+            
+            # OBTENER DATOS CONFIRMADOS para cálculos
+            fertilizantes_confirmados = obtener_datos_confirmados('fertilizantes', f'ciclo_{i+1}')
+            
+            if fertilizantes_confirmados:
+                em_fert_prod, em_fert_co2_urea, em_fert_n2o_dir, em_fert_n2o_ind, desglose_fert = calcular_emisiones_fertilizantes(
+                    {"fertilizantes": fertilizantes_confirmados}, 1
+                )
+                em_fert_total = em_fert_prod + em_fert_co2_urea + em_fert_n2o_dir + em_fert_n2o_ind
+                st.info(
+                    f"**Fertilizantes (Ciclo {i+1}):**\n"
+                    f"- Producción de fertilizantes: {format_num(em_fert_prod)} kg CO₂e/ha\n"
+                    f"- Emisiones CO₂ por hidrólisis de urea: {format_num(em_fert_co2_urea)} kg CO₂e/ha\n"
+                    f"- Emisiones directas N₂O: {format_num(em_fert_n2o_dir)} kg CO₂e/ha\n"
+                    f"- Emisiones indirectas N₂O: {format_num(em_fert_n2o_ind)} kg CO₂e/ha\n"
+                    f"- **Total fertilizantes:** {format_num(em_fert_total)} kg CO₂e/ha"
+                )
+            else:
+                st.info(f"ℹ️ Ingrese y confirme los fertilizantes para el ciclo {i+1}")
+                em_fert_prod = em_fert_co2_urea = em_fert_n2o_dir = em_fert_n2o_ind = 0
+                em_fert_total = 0
+                desglose_fert = []
+
+            st.subheader("Agroquímicos y pesticidas")
+            agroq = ingresar_agroquimicos(f"ciclo_{i+1}")
+            
+            # OBTENER DATOS CONFIRMADOS para cálculos
+            agroquimicos_confirmados = obtener_datos_confirmados('agroquimicos', f'ciclo_{i+1}')
+            
+            if agroquimicos_confirmados:
+                em_agroq = calcular_emisiones_agroquimicos(agroquimicos_confirmados, 1)
+                st.info(
+                    f"**Agroquímicos (Ciclo {i+1}):**\n"
+                    f"- **Total agroquímicos:** {format_num(em_agroq)} kg CO₂e/ha"
+                )
+            else:
+                st.info(f"ℹ️ Ingrese y confirme los agroquímicos para el ciclo {i+1}")
+                em_agroq = 0
+                agroq = []
+
+            st.subheader("Riego")
+            em_agua, em_energia, energia_actividades = ingresar_riego_ciclo(f"ciclo_{i+1}")
+            tipo_riego = st.session_state.get(f"tipo_riego_ciclo_{i+1}", "")
+
+            st.subheader("Labores y maquinaria")
+            labores = ingresar_maquinaria_ciclo(f"ciclo_{i+1}")
+            
+            if labores:
+                em_maq = calcular_emisiones_maquinaria(labores, 1)
+                st.info(
+                    f"**Maquinaria (Ciclo {i+1}):**\n"
+                    f"- **Total maquinaria:** {format_num(em_maq)} kg CO₂e/ha"
+                )
+            else:
+                st.info(f"ℹ️ Ingrese labores y maquinaria para el ciclo {i+1}")
+                em_maq = 0
+
+            em_residuos, detalle_residuos = ingresar_gestion_residuos(f"ciclo_{i+1}")
+            st.info(
+                f"**Gestión de residuos (Ciclo {i+1}):**\n"
+                f"- **Total gestión de residuos:** {format_num(em_residuos)} kg CO₂e/ha"
+            )
+
+            # Solo sumar si hay datos confirmados
+            if fertilizantes_confirmados or agroquimicos_confirmados or labores:
+                em_ciclo = em_fert_total + em_agroq + em_agua + em_energia + em_maq + em_residuos
+                em_total += em_ciclo
+                prod_total += produccion
+                
+                desglose_fuentes_ciclos.append({
+                    "Ciclo": i+1,
+                    "Fertilizantes": em_fert_total,
+                    "Agroquímicos": em_agroq,
+                    "Riego": em_agua + em_energia,
+                    "Maquinaria": em_maq,
+                    "Residuos": em_residuos,
+                    "desglose_fertilizantes": desglose_fert,
+                    "desglose_agroquimicos": agroquimicos_confirmados if agroquimicos_confirmados else [],
+                    "desglose_maquinaria": labores,
+                    "desglose_riego": {
+                        "tipo_riego": tipo_riego,
+                        "emisiones_agua": em_agua,
+                        "emisiones_energia": em_energia,
+                        "energia_actividades": energia_actividades
+                    },
+                    "desglose_residuos": detalle_residuos
+                })
+                emisiones_ciclos.append((i+1, em_ciclo, produccion))
+
+                total_fert += em_fert_total
+                total_agroq += em_agroq
+                total_riego += em_agua + em_energia
+                total_maq += em_maq
+                total_res += em_residuos
+
+                st.info(f"Huella de carbono en ciclo {i+1}: {format_num(em_ciclo)} kg CO₂e/ha·ciclo")
+            else:
+                st.warning(f"⚠️ Confirma los datos en cada sección para el ciclo {i+1}")
+
+        if n_ciclos > 1 and emisiones_ciclos:
+            st.markdown("### Comparación de emisiones entre ciclos")
+            for ciclo, em, prod in emisiones_ciclos:
+                st.write(f"Ciclo {ciclo}: {format_num(em)} kg CO₂e/ha·ciclo, Producción: {format_num(prod)} kg/ha·ciclo")
+
+        # Solo guardar si hay datos
+        if total_fert > 0 or total_agroq > 0 or total_riego > 0 or total_maq > 0 or total_res > 0:
+            st.session_state.emisiones_fuentes["Fertilizantes"] = total_fert
+            st.session_state.emisiones_fuentes["Agroquímicos"] = total_agroq
+            st.session_state.emisiones_fuentes["Riego"] = total_riego
+            st.session_state.emisiones_fuentes["Maquinaria"] = total_maq
+            st.session_state.emisiones_fuentes["Residuos"] = total_res
+
+            st.session_state.emisiones_etapas["Anual"] = em_total
+            st.session_state.produccion_etapas["Anual"] = prod_total
+            st.session_state.emisiones_fuente_etapa["Anual"] = {
+                "Fertilizantes": st.session_state.emisiones_fuentes["Fertilizantes"],
+                "Agroquímicos": st.session_state.emisiones_fuentes["Agroquímicos"],
+                "Riego": st.session_state.emisiones_fuentes["Riego"],
+                "Maquinaria": st.session_state.emisiones_fuentes["Maquinaria"],
+                "Residuos": st.session_state.emisiones_fuentes["Residuos"]
+            }
+
+    # Guardar siempre (incluso si está vacío) para mantener la estructura
+    st.session_state["emisiones_ciclos"] = emisiones_ciclos
+    st.session_state["desglose_fuentes_ciclos"] = desglose_fuentes_ciclos
+    
+    # Actualizar em_total y prod_total en session_state
+    st.session_state.em_total = em_total
+    st.session_state.prod_total = prod_total
+    
+    return em_total, prod_total
+
+# =============================================================================
+# ETAPAS MODO DE ANÁLISIS PERENNE
+# =============================================================================
 
 def etapa_implantacion():
     st.header("Implantación")
@@ -3390,229 +5622,7 @@ def etapa_produccion_segmentada():
 
     return em_total, prod_total
 
-def etapa_anual():
-    st.header("Ciclo anual")
-    n_ciclos = st.number_input("¿Cuántos ciclos realiza por año?", min_value=1, step=1, key="n_ciclos")
-    ciclos_diferentes = st.radio(
-        "¿Los ciclos son diferentes entre sí?",
-        ["No, todos los ciclos son iguales", "Sí, cada ciclo es diferente"],
-        key="ciclos_diferentes"
-    )
-    if ciclos_diferentes == "No, todos los ciclos son iguales":
-        st.info(
-            f"""
-            Todos los datos que ingrese a continuación se **asumirán iguales para cada ciclo** y se multiplicarán por {n_ciclos} ciclos.
-            Es decir, el sistema considerará que en todos los ciclos usted mantiene los mismos consumos, actividades y hábitos de manejo.
-            Si existen diferencias importantes entre ciclos, le recomendamos ingresar el detalle ciclo por ciclo.
-            """
-        )
-    else:
-        st.info(
-            "Ingrese los datos correspondientes a cada ciclo. El sistema sumará los valores de todos los ciclos, permitiendo reflejar cambios o variaciones entre ciclos."
-        )
-
-    em_total = 0
-    prod_total = 0
-    emisiones_ciclos = []
-    desglose_fuentes_ciclos = []
-
-    if ciclos_diferentes == "No, todos los ciclos son iguales":
-        st.markdown("### Datos para un ciclo típico (se multiplicará por el número de ciclos)")
-        produccion = st.number_input("Producción de fruta en el ciclo (kg/ha·ciclo)", min_value=0.0, key="prod_ciclo_tipico")
-        
-        st.markdown("---")
-        st.subheader("Fertilizantes")
-        fert = ingresar_fertilizantes("ciclo_tipico", unidad_cantidad="ciclo")
-        em_fert_prod, em_fert_co2_urea, em_fert_n2o_dir, em_fert_n2o_ind, desglose_fert = calcular_emisiones_fertilizantes(fert, 1)
-        em_fert_total = em_fert_prod + em_fert_co2_urea + em_fert_n2o_dir + em_fert_n2o_ind
-        st.info(
-            f"**Fertilizantes (por ciclo):**\n"
-            f"- Producción de fertilizantes: {format_num(em_fert_prod)} kg CO₂e/ha·ciclo\n"
-            f"- Emisiones CO₂ por hidrólisis de urea: {format_num(em_fert_co2_urea)} kg CO₂e/ha·ciclo\n"
-            f"- Emisiones directas N₂O: {format_num(em_fert_n2o_dir)} kg CO₂e/ha·ciclo\n"
-            f"- Emisiones indirectas N₂O: {format_num(em_fert_n2o_ind)} kg CO₂e/ha·ciclo\n"
-            f"- **Total fertilizantes:** {format_num(em_fert_total)} kg CO₂e/ha·ciclo"
-        )
-
-        st.markdown("---")
-        st.subheader("Agroquímicos y pesticidas")
-        agroq = ingresar_agroquimicos("ciclo_tipico")
-        em_agroq = calcular_emisiones_agroquimicos(agroq, 1)
-        st.info(
-            f"**Agroquímicos (por ciclo):**\n"
-            f"- **Total agroquímicos:** {format_num(em_agroq)} kg CO₂e/ha·ciclo"
-        )
-
-        st.markdown("---")
-        st.subheader("Riego")
-        em_agua, em_energia, energia_actividades = ingresar_riego_ciclo("ciclo_tipico")
-        tipo_riego = st.session_state.get("tipo_riego_ciclo_tipico", "")
-
-        st.markdown("---")
-        st.subheader("Labores y maquinaria")
-        labores = ingresar_maquinaria_ciclo("ciclo_tipico")
-        em_maq = calcular_emisiones_maquinaria(labores, 1)
-        st.info(
-            f"**Maquinaria (por ciclo):**\n"
-            f"- **Total maquinaria:** {format_num(em_maq)} kg CO₂e/ha·ciclo"
-        )
-
-        em_residuos, detalle_residuos = ingresar_gestion_residuos("ciclo_tipico")
-        st.info(
-            f"**Gestión de residuos (por ciclo):**\n"
-            f"- **Total gestión de residuos:** {format_num(em_residuos)} kg CO₂e/ha·ciclo"
-        )
-
-        em_ciclo = em_fert_total + em_agroq + em_agua + em_energia + em_maq + em_residuos
-        em_total = em_ciclo * n_ciclos
-        prod_total = produccion * n_ciclos
-        for ciclo in range(1, int(n_ciclos) + 1):
-            desglose_fuentes_ciclos.append({
-                "Ciclo": ciclo,
-                "Fertilizantes": em_fert_total,
-                "Agroquímicos": em_agroq,
-                "Riego": em_agua + em_energia,
-                "Maquinaria": em_maq,
-                "Residuos": em_residuos,
-                "desglose_fertilizantes": desglose_fert,
-                "desglose_agroquimicos": agroq,
-                "desglose_maquinaria": labores,
-                "desglose_riego": {
-                    "tipo_riego": tipo_riego,
-                    "emisiones_agua": em_agua,
-                    "emisiones_energia": em_energia,
-                    "energia_actividades": energia_actividades
-                },
-                "desglose_residuos": detalle_residuos
-            })
-            emisiones_ciclos.append((ciclo, em_ciclo, produccion))
-
-        emisiones_fuentes["Fertilizantes"] = em_fert_total * n_ciclos
-        emisiones_fuentes["Agroquímicos"] = em_agroq * n_ciclos
-        emisiones_fuentes["Riego"] = (em_agua + em_energia) * n_ciclos
-        emisiones_fuentes["Maquinaria"] = em_maq * n_ciclos
-        emisiones_fuentes["Residuos"] = em_residuos * n_ciclos
-
-        st.info(f"Huella de carbono por ciclo típico: {format_num(em_ciclo)} kg CO₂e/ha·ciclo")
-        st.info(f"Huella de carbono anual (todos los ciclos): {format_num(em_total)} kg CO₂e/ha·año")
-
-        emisiones_etapas["Anual"] = em_total
-        produccion_etapas["Anual"] = prod_total
-        emisiones_fuente_etapa["Anual"] = {
-            "Fertilizantes": emisiones_fuentes["Fertilizantes"],
-            "Agroquímicos": emisiones_fuentes["Agroquímicos"],
-            "Riego": emisiones_fuentes["Riego"],
-            "Maquinaria": emisiones_fuentes["Maquinaria"],
-            "Residuos": emisiones_fuentes["Residuos"]
-        }
-
-    else:
-        total_fert = 0
-        total_agroq = 0
-        total_riego = 0
-        total_maq = 0
-        total_res = 0
-        for i in range(int(n_ciclos)):
-            st.markdown(f"### Ciclo {i+1}")
-            produccion = st.number_input(f"Producción de fruta en el ciclo {i+1} (kg/ha·ciclo)", min_value=0.0, key=f"prod_ciclo_{i+1}")
-
-            st.subheader("Fertilizantes")
-            fert = ingresar_fertilizantes(f"ciclo_{i+1}", unidad_cantidad="ciclo")
-            em_fert_prod, em_fert_co2_urea, em_fert_n2o_dir, em_fert_n2o_ind, desglose_fert = calcular_emisiones_fertilizantes(fert, 1)
-            em_fert_total = em_fert_prod + em_fert_co2_urea + em_fert_n2o_dir + em_fert_n2o_ind
-            st.info(
-                f"**Fertilizantes (Ciclo {i+1}):**\n"
-                f"- Producción de fertilizantes: {format_num(em_fert_prod)} kg CO₂e/ha\n"
-                f"- Emisiones CO₂ por hidrólisis de urea: {format_num(em_fert_co2_urea)} kg CO₂e/ha\n"
-                f"- Emisiones directas N₂O: {format_num(em_fert_n2o_dir)} kg CO₂e/ha\n"
-                f"- Emisiones indirectas N₂O: {format_num(em_fert_n2o_ind)} kg CO₂e/ha\n"
-                f"- **Total fertilizantes:** {format_num(em_fert_total)} kg CO₂e/ha"
-            )
-
-            st.subheader("Agroquímicos y pesticidas")
-            agroq = ingresar_agroquimicos(f"ciclo_{i+1}")
-            em_agroq = calcular_emisiones_agroquimicos(agroq, 1)
-            st.info(
-                f"**Agroquímicos (Ciclo {i+1}):**\n"
-                f"- **Total agroquímicos:** {format_num(em_agroq)} kg CO₂e/ha"
-            )
-
-            st.subheader("Riego")
-            em_agua, em_energia, energia_actividades = ingresar_riego_ciclo(f"ciclo_{i+1}")
-            tipo_riego = st.session_state.get(f"tipo_riego_ciclo_{i+1}", "")
-
-            st.subheader("Labores y maquinaria")
-            labores = ingresar_maquinaria_ciclo(f"ciclo_{i+1}")
-            em_maq = calcular_emisiones_maquinaria(labores, 1)
-            st.info(
-                f"**Maquinaria (Ciclo {i+1}):**\n"
-                f"- **Total maquinaria:** {format_num(em_maq)} kg CO₂e/ha"
-            )
-
-            em_residuos, detalle_residuos = ingresar_gestion_residuos(f"ciclo_{i+1}")
-            st.info(
-                f"**Gestión de residuos (Ciclo {i+1}):**\n"
-                f"- **Total gestión de residuos:** {format_num(em_residuos)} kg CO₂e/ha"
-            )
-
-            em_ciclo = em_fert_total + em_agroq + em_agua + em_energia + em_maq + em_residuos
-            em_total += em_ciclo
-            prod_total += produccion
-            desglose_fuentes_ciclos.append({
-                "Ciclo": i+1,
-                "Fertilizantes": em_fert_total,
-                "Agroquímicos": em_agroq,
-                "Riego": em_agua + em_energia,
-                "Maquinaria": em_maq,
-                "Residuos": em_residuos,
-                "desglose_fertilizantes": desglose_fert,
-                "desglose_agroquimicos": agroq,
-                "desglose_maquinaria": labores,
-                "desglose_riego": {
-                    "tipo_riego": tipo_riego,
-                    "emisiones_agua": em_agua,
-                    "emisiones_energia": em_energia,
-                    "energia_actividades": energia_actividades
-                },
-                "desglose_residuos": detalle_residuos
-            })
-            emisiones_ciclos.append((i+1, em_ciclo, produccion))
-
-            total_fert += em_fert_total
-            total_agroq += em_agroq
-            total_riego += em_agua + em_energia
-            total_maq += em_maq
-            total_res += em_residuos
-
-            st.info(f"Huella de carbono en ciclo {i+1}: {format_num(em_ciclo)} kg CO₂e/ha·ciclo")
-
-        if n_ciclos > 1:
-            st.markdown("### Comparación de emisiones entre ciclos")
-            for ciclo, em, prod in emisiones_ciclos:
-                st.write(f"Ciclo {ciclo}: {format_num(em)} kg CO₂e/ha·ciclo, Producción: {format_num(prod)} kg/ha·ciclo")
-
-        emisiones_fuentes["Fertilizantes"] = total_fert
-        emisiones_fuentes["Agroquímicos"] = total_agroq
-        emisiones_fuentes["Riego"] = total_riego
-        emisiones_fuentes["Maquinaria"] = total_maq
-        emisiones_fuentes["Residuos"] = total_res
-
-        emisiones_etapas["Anual"] = em_total
-        produccion_etapas["Anual"] = prod_total
-        emisiones_fuente_etapa["Anual"] = {
-            "Fertilizantes": emisiones_fuentes["Fertilizantes"],
-            "Agroquímicos": emisiones_fuentes["Agroquímicos"],
-            "Riego": emisiones_fuentes["Riego"],
-            "Maquinaria": emisiones_fuentes["Maquinaria"],
-            "Residuos": emisiones_fuentes["Residuos"]
-        }
-
-    st.session_state["emisiones_ciclos"] = emisiones_ciclos
-    st.session_state["desglose_fuentes_ciclos"] = desglose_fuentes_ciclos
-    return em_total, prod_total
-
 import locale
-
 # Establecer el locale a español para los formatos numéricos
 try:
     locale.setlocale(locale.LC_ALL, 'es_ES.UTF-8')
@@ -3802,13 +5812,38 @@ import numpy as np
 ###################################################
 
 def mostrar_resultados_anual(em_total, prod_total):
-    st.header("Resultados Finales")
-    st.info(
-        "En esta sección se presentan los resultados globales y desglosados del cálculo de huella de carbono para el cultivo anual. "
-        "Se muestran los resultados globales del sistema productivo, el detalle por ciclo productivo y por fuente de emisión, "
-        "y finalmente el desglose interno de cada fuente. Todas las tablas muestran emisiones en kg CO₂e/ha·año y kg CO₂e/kg fruta·año. "
-        "Todos los gráficos muestran emisiones en kg CO₂e/ha·año."
-    )
+    # =========================================================================
+    # VERIFICAR MODO VISUALIZACIÓN - Mensaje diferente
+    # =========================================================================
+    if st.session_state.get('modo_visualizacion', False):
+        st.header("📊 Resultados Finales del Proyecto")
+        st.success("✅ **PROYECTO GUARDADO** - Solo modo visualización")
+        
+        # Información específica para modo visualización
+        st.info(
+            "Estos son los resultados finales del proyecto guardado. "
+            "Los datos ya no se pueden modificar. "
+            "Para crear una versión editable, usa la opción 'Crear nueva versión' en el sidebar."
+        )
+    else:
+        st.header("📈 Resultados Preliminares")
+        st.warning("⚠️ **PROYECTO EN EDICIÓN** - Estos resultados son preliminares")
+        
+        # Información específica para modo edición
+        st.info(
+            "En esta sección se presentan los resultados globales y desglosados del cálculo de huella de carbono para el cultivo anual. "
+            "Se muestran los resultados globales del sistema productivo, el detalle por ciclo productivo y por fuente de emisión, "
+            "y finalmente el desglose interno de cada fuente. Todas las tablas muestran emisiones en kg CO₂e/ha·año y kg CO₂e/kg fruta·año. "
+            "Todos los gráficos muestran emisiones en kg CO₂e/ha·año."
+        )
+        
+        # Recordatorio para guardar
+        st.warning("""
+        **⚠️ IMPORTANTE:** 
+        Estos resultados son PRELIMINARES. 
+        Para guardarlos permanentemente, usa el botón **'💾 Guardar Proyecto'** en el sidebar.
+        Una vez guardado, no podrás modificar los datos.
+        """)
 
     # --- USAR VARIABLES DE SESSION_STATE - VERSIÓN CORREGIDA ---
     # Eliminar la línea 'global' y usar directamente session_state
@@ -3838,7 +5873,15 @@ def mostrar_resultados_anual(em_total, prod_total):
 
     # --- Resultados globales ---
     st.markdown("#### Resultados globales")
+    
+    # Mensaje diferente según el modo
+    if st.session_state.get('modo_visualizacion', False):
+        st.success("✅ **Resultados finales calculados**")
+    else:
+        st.warning("📊 **Resultados preliminares calculados**")
+    
     st.metric("Huella de carbono por hectárea", format_num(em_total, 2) + " kg CO₂e/ha·año")
+    
     if prod_total > 0:
         st.metric("Huella de carbono por kg de fruta", format_num(em_total / prod_total, 3) + " kg CO₂e/kg fruta")
     else:
@@ -4609,57 +6652,95 @@ def mostrar_resultados_anual(em_total, prod_total):
         "emisiones_fuente_etapa": emisiones_fuente_etapa.copy()
     }
 
-# GUARDAR EN SUPABASE - VERSIÓN MEJORADA
-if st.session_state.get('current_project_id') and st.session_state.get('supabase'):
-    try:
-        # Obtener los valores de session_state
-        em_total = st.session_state.get('em_total', 0)
-        prod_total = st.session_state.get('prod_total', 1)  # Evitar división por cero
-        emisiones_fuentes = st.session_state.get('emisiones_fuentes', {})
+# =============================================================================
+# BOTÓN DE GUARDADO MANUAL EN RESULTADOS
+# =============================================================================
+
+def mostrar_boton_guardado_manual():
+    """Muestra un botón para guardar manualmente los resultados"""
+    
+    # =========================================================================
+    # VERIFICAR MODO VISUALIZACIÓN
+    # =========================================================================
+    if st.session_state.get('modo_visualizacion', False):
+        # MODO VISUALIZACIÓN: NO mostrar botón de guardado
+        # Solo mostrar información del proyecto guardado
+        st.markdown("---")
+        st.markdown("### ✅ Proyecto Guardado")
         
-        # Preparar datos para Supabase
-        project_data = {
-            "characterization": {
-                "cultivo": st.session_state.get('cultivo', 'No especificado'),
-                "ubicacion": st.session_state.get('ubicacion', 'No especificado'), 
-                "tipo_suelo": st.session_state.get('tipo_suelo', 'No especificado'),
-                "clima": st.session_state.get('clima', 'No especificado'),
-                "morfologia": st.session_state.get('morfologia', 'No especificado')
-            },
-            "sources_data": {
-                "fertilizantes": st.session_state.get("fertilizantes_data", []),
-                "agroquimicos": st.session_state.get("agroquimicos_data", []),
-                "riego": st.session_state.get("riego_data", []),
-                "maquinaria": st.session_state.get("maquinaria_data", []),
-                "residuos": st.session_state.get("residuos_data", [])
-            },
-            "results": {
-                "emisiones_totales": float(em_total),
-                "produccion_total": float(prod_total),
-                "huella_por_kg": float(em_total / prod_total) if prod_total > 0 else 0,
-                "emisiones_fuentes": {k: float(v) for k, v in emisiones_fuentes.items()},
-                "fecha_calculo": datetime.now().isoformat()
-            },
-            "consent_text": st.session_state.get('consentimiento_texto', ''),
-            "consent_timestamp": st.session_state.get('consentimiento_fecha', ''),
-            "mode": "anual",  # ✅ MODO EXPLÍCITO
-            "app_version": "1.0",
-            "updated_at": datetime.now().isoformat()
-        }
-        
-        # Actualizar proyecto en Supabase
-        response = st.session_state.supabase.table("projects")\
-                                       .update(project_data)\
-                                       .eq("id", st.session_state.current_project_id)\
-                                       .execute()
-        
-        if not hasattr(response, 'error') or not response.error:
-            st.sidebar.success("✅ Datos guardados correctamente en Supabase")
-        else:
-            st.sidebar.error("❌ Error al guardar en Supabase")
+        with st.expander("📋 Información del proyecto", expanded=False):
+            st.success("Este proyecto ya está guardado en la nube.")
             
-    except Exception as e:
-        st.sidebar.error(f"❌ Error al guardar: {str(e)}")
+            # Mostrar información básica
+            st.write(f"**Nombre:** {st.session_state.get('current_project_name', 'Sin nombre')}")
+            st.write(f"**Usuario:** {st.session_state.get('current_user_email', 'Desconocido')}")
+            
+            ultimo_guardado = st.session_state.get('ultimo_guardado')
+            if ultimo_guardado:
+                st.write(f"**Último guardado:** {ultimo_guardado}")
+            
+            # Botón para crear nueva versión
+            if st.button("🆕 Crear nueva versión (copia editable)", use_container_width=True):
+                # Crear copia como nuevo proyecto local
+                st.session_state.current_project_id = f"local_{uuid.uuid4()}"
+                st.session_state.current_project_name = f"{st.session_state.current_project_name} - Copia"
+                st.session_state.modo_visualizacion = False  # Volver a modo edición
+                st.session_state.guardado_pendiente = True
+                
+                # Limpiar resultados temporales
+                st.session_state.em_total = 0
+                st.session_state.prod_total = 0
+                
+                st.rerun()
+        
+        return  # Salir de la función
+    
+    # =========================================================================
+    # MODO EDICIÓN: Mostrar botón de guardado normal
+    # =========================================================================
+    st.markdown("---")
+    st.markdown("### 💾 Guardar Resultados")
+    
+    with st.expander("📤 Opciones de guardado", expanded=False):
+        col1, col2, col3 = st.columns(3)  # Cambiar a 3 columnas
+        
+        with col1:
+            # Botón para guardar en Supabase
+            if st.session_state.get('supabase') and st.session_state.get('current_project_id'):
+                if st.button("✅ Guardar en la nube", use_container_width=True, type="primary"):
+                    if guardar_proyecto_completo():
+                        st.success("✅ Resultados guardados exitosamente en Supabase")
+                        # NO hacer st.rerun() aquí
+                    else:
+                        st.error("❌ Error al guardar en la nube")
+            else:
+                st.warning("⚠️ No hay conexión con la nube")
+                if st.button("🔗 Reconectar", use_container_width=True, type="secondary"):
+                    st.session_state.supabase = init_supabase_connection()
+                    st.rerun()
+        
+        with col2:
+            # Botón para exportar a Excel/PDF
+            if st.button("📄 Exportar reporte", use_container_width=True, type="secondary"):
+                st.info("Funcionalidad de exportación en desarrollo")
+        
+        with col3:
+            # Botón para recargar manualmente (solo si es necesario)
+            if st.session_state.get('necesita_recarga', False):
+                if st.button("🔄 Recargar página", use_container_width=True, type="secondary"):
+                    st.session_state.necesita_recarga = False
+                    st.rerun()
+        
+        # Indicador de estado
+        ultimo_guardado = st.session_state.get('ultimo_guardado')
+        if ultimo_guardado:
+            st.caption(f"Último guardado: {ultimo_guardado}")
+        elif st.session_state.get('datos_pendientes_guardar', False):
+            st.warning("⚠️ Hay cambios sin guardar")
+        
+        # Mostrar si hay resultados temporales guardados
+        if 'resultados_temporales' in st.session_state:
+            st.info("💡 Hay resultados temporales guardados. Los cálculos se mantendrán.")
 
 ###################################################
 # RESULTADOS PARA CULTIVO PERENNE
@@ -5299,62 +7380,6 @@ def mostrar_resultados_perenne(em_total, prod_total):
         "detalle_residuos": st.session_state.get("detalle_residuos", []),
         "emisiones_anuales": st.session_state.get("emisiones_anuales", [])
     }
-
-    # GUARDAR EN SUPABASE - VERSIÓN MEJORADA
-if st.session_state.get('current_project_id') and st.session_state.get('supabase'):
-    try:
-        # Obtener los valores de session_state (NO usar variables globales)
-        em_total = st.session_state.get('em_total', 0)
-        prod_total = st.session_state.get('prod_total', 1)  # Evitar división por cero
-        emisiones_fuentes = st.session_state.get('emisiones_fuentes', {})
-        emisiones_etapas = st.session_state.get('emisiones_etapas', {})
-        produccion_etapas = st.session_state.get('produccion_etapas', {})
-        
-        # Preparar datos para Supabase
-        project_data = {
-            "characterization": {
-                "cultivo": st.session_state.get('cultivo', 'No especificado'),
-                "ubicacion": st.session_state.get('ubicacion', 'No especificado'),
-                "tipo_suelo": st.session_state.get('tipo_suelo', 'No especificado'),
-                "clima": st.session_state.get('clima', 'No especificado'),
-                "morfologia": st.session_state.get('morfologia', 'No especificado')
-            },
-            "sources_data": {
-                "fertilizantes": st.session_state.get("fertilizantes_data", []),
-                "agroquimicos": st.session_state.get("agroquimicos_data", []),
-                "riego": st.session_state.get("riego_data", []),
-                "maquinaria": st.session_state.get("maquinaria_data", []),
-                "residuos": st.session_state.get("residuos_data", [])
-            },
-            "results": {
-                "emisiones_totales": float(em_total),
-                "produccion_total": float(prod_total),
-                "huella_por_kg": float(em_total / prod_total) if prod_total > 0 else 0,
-                "emisiones_fuentes": {k: float(v) for k, v in emisiones_fuentes.items()},
-                "emisiones_etapas": {k: float(v) for k, v in emisiones_etapas.items()},
-                "produccion_etapas": {k: float(v) for k, v in produccion_etapas.items()},
-                "fecha_calculo": datetime.now().isoformat()
-            },
-            "consent_text": st.session_state.get('consentimiento_texto', ''),
-            "consent_timestamp": st.session_state.get('consentimiento_fecha', ''),
-            "mode": "perenne",  # ✅ MODO EXPLÍCITO
-            "app_version": "1.0",
-            "updated_at": datetime.now().isoformat()
-        }
-        
-        # Actualizar proyecto en Supabase
-        response = st.session_state.supabase.table("projects")\
-                                       .update(project_data)\
-                                       .eq("id", st.session_state.current_project_id)\
-                                       .execute()
-        
-        if not hasattr(response, 'error') or not response.error:
-            st.sidebar.success("✅ Datos guardados correctamente en Supabase")
-        else:
-            st.sidebar.error("❌ Error al guardar en Supabase")
-            
-    except Exception as e:
-        st.sidebar.error(f"❌ Error al guardar: {str(e)}")
 
 # -----------------------------
 # Interfaz principal
